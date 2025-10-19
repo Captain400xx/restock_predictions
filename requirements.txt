@@ -1,0 +1,9 @@
+streamlit
+pandas
+plotly
+prophet
+scikit-learn
+lightgbm
+xgboost
+catboost
+pytz
