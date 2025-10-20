@@ -1,5 +1,5 @@
 # ----------------------------------------------------------------------
-# Pokémon Card Drop Forecast - v7.5 (Ensure forecast_hours definition)
+# Pokémon Card Drop Forecast - v7.6 (Branding Update)
 # ----------------------------------------------------------------------
 
 # -------------------------
@@ -26,7 +26,15 @@ warnings.filterwarnings("ignore")
 # -------------------------
 # 2. App Configuration & Initial Setup
 # -------------------------
-st.set_page_config(page_title="Pokémon Restock Forecast", layout="wide", initial_sidebar_state="expanded")
+# --- CHANGE 1: Added page_icon to set the browser tab logo ---
+# Make sure 'logo.png' is in the same folder as this script.
+st.set_page_config(
+    page_title="RestockR Predictions", 
+    page_icon="logo2.png",
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
+
 EASTERN = pytz.timezone('US/Eastern')
 DATA_FILE = "my_restock_data.csv"
 
@@ -207,8 +215,7 @@ def create_calendar_heatmap(forecast_df, retailer):
             day_idx = row['day_of_week']
             heatmap_data[day_idx, week_idx] = row['yhat']
             text_data[day_idx, week_idx] = row['day_str']
-        except (IndexError, ValueError):
-            continue
+        except (IndexError, ValueError): continue
     fig = go.Figure(data=go.Heatmap(z=heatmap_data, x=[f"Week {w}" for w in weeks], y=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], hoverongaps=False, text=text_data, texttemplate="%{text}", colorscale='Oranges', colorbar_title='Max Activity'))
     fig.update_layout(title=f"Daily Activity Heatmap for {retailer}", xaxis_title="Week of the Year", height=400)
     return fig
@@ -228,7 +235,14 @@ def create_hourly_heatmap(forecast_df, retailer):
 # -------------------------
 # 5. Main App Logic
 # -------------------------
-st.title("🃏 Pokémon Card Restock Forecast")
+# --- CHANGE 2: Use columns to create a title with a logo ---
+col1, col2 = st.columns([1, 8])
+with col1:
+    if os.path.exists("logo2.png"):
+        st.image("logo2.png", width=100)
+with col2:
+    st.title("RestockR Predictions: Pokemon Card Restock Forecast")
+
 raw_data_string = load_main_data(DATA_FILE)
 if raw_data_string is None: st.stop()
 full_df = process_data_for_forecasting(raw_data_string)
@@ -264,7 +278,6 @@ retailer = st.sidebar.selectbox("Choose a retailer to forecast", retailers, inde
 
 st.sidebar.markdown("---")
 forecast_horizon = st.sidebar.slider("Forecast Horizon (days)", 7, 30, 14, 1)
-# --- Ensure forecast_hours is defined here ---
 forecast_hours = forecast_horizon * 24 
 
 st.sidebar.markdown("---")
