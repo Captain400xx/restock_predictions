@@ -1,56 +1,98 @@
-# RestockR Predictions
+# Pokémon Card Restock Forecasting App
 
-A Streamlit dashboard that provides Pokémon Card restock predictions and visualizes model feature importance.
-
-
+This Streamlit application uses a combination of time-series and machine learning models to forecast Pokémon TCG restocks from various online retailers. It's designed to identify high-probability restock windows by finding a consensus among four different forecasting models.
 
 ---
 
-## Features
+## 🧩 Features
 
-* **Alert Countdown:** Displays a live countdown to the next data refresh or alert trigger.
-* **Model Feature Importance:** Visualizes the key factors driving the model's predictions.
-* **Interactive Controls:** A sidebar with controls to filter, sort, or update the data being displayed.
-* 4 model predictions
+### Multi-Model Ensemble
+Combines predictions from **Prophet**, **LightGBM**, **XGBoost**, and **CatBoost** for higher confidence.
+
+### Prediction Schedule
+A color-coded schedule highlights upcoming restock windows and ranks them by confidence level (**High**, **Medium**, **Low**).
+
+### 2-Week Accuracy View
+A special chart compares the model's forecast for the past week against actual historical data, providing a visual check on accuracy.
+
+### In-Depth Analysis
+Includes **heatmaps** to visualize the most active days of the month and hours of the day for restocks.
+
+### Feature Importance
+Shows which factors (e.g., time of day, day of week) are most influential in making predictions.
+
+### Customizable UI
+Includes a simple **color picker** to customize chart appearances.
 
 ---
 
-## How to Run
-
-Follow these instructions to get a local copy up and running.
+## 🧠 How to Run Locally
 
 ### Prerequisites
+- **Python 3.9+**
+- **pip** for package installation
 
-* Python 3.8+
+---
 
-### Installation
-
-1.  **Clone the repository:**
-    ```bash
-    git clone [https://github.com/Captain400xx/restock_predictions].git
-    cd [restock_predictions]
-    ```
-
-2.  **Create and activate a virtual environment (Recommended):**
-    ```bash
-    # For macOS/Linux
-    python3 -m venv venv
-    source venv/bin/activate
-    
-    # For Windows
-    python -m venv venv
-    .\venv\Scripts\activate
-    ```
-
-3.  **Install the required packages:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-### Running the App
-
-Once all dependencies are installed, run the following command from your project's root directory:
+### 1. Clone the Repository
+Clone this repository to your local machine and navigate into the directory:
 
 ```bash
+git clone https://github.com/YOUR-USERNAME/YOUR-REPOSITORY-NAME.git
+cd YOUR-REPOSITORY-NAME
+```
 
-streamlit run app2.py
+---
+
+### 2. Set Up Your Data
+You must have a CSV file containing your historical restock data.
+
+- The file must be named **my_restock_data.csv**
+- It must have at least two columns: `DateTime` and `Retailer`
+- Place this file in the same root directory as the `app.py` script
+
+---
+
+### 3. Install Dependencies
+Navigate to the project directory in your terminal and run:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+### 4. Run the App
+Once the dependencies are installed, run the following command:
+
+```bash
+streamlit run app.py
+```
+
+---
+
+## 📈 Version History
+
+### v4.0 - Major Accuracy & UI Overhaul
+This version introduces a significant upgrade to the underlying models for improved accuracy and adds several new UI features for better analysis and usability.
+
+#### 🧠 Major Model Overhaul
+**Advanced Feature Engineering:**  
+The ML models (**LightGBM**, **XGBoost**, **CatBoost**) now use a much richer feature set for higher accuracy, including:
+
+- **Lag Features:** To teach models about momentum (e.g., `activity_24_hours_ago`)
+- **Cyclical Features:** To help models understand the circular nature of time (e.g., that 11 PM is next to 12 AM)
+- **Contextual Features:** Adds human context (e.g., `is_weekend`, `is_business_hours`) to prevent incorrect predictions like weekend restocks for weekday-only retailers
+- **Poisson Objective:** Models have been retuned with a “Poisson” objective, better suited for predicting spike frequencies and rare events
+
+#### ✨ New Features & UI Enhancements
+- **New Tab – “2-Week View”:** Overlaps the past 7 days of actual data with the model's forecast for visual accuracy checks  
+- **New “Prediction Schedule” Chart:** Displays upcoming predictions, color-coded by confidence level  
+- **New “Data Summary”:** Sidebar now shows key stats like data range and total recorded events  
+- **New “Chart Color Picker”:** Sidebar control for customizing forecast line color  
+
+---
+
+## 👨‍💻 Credits
+This application was created and is maintained by **Captain400x**.
+
