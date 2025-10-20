@@ -38,8 +38,8 @@ Includes a simple **color picker** to customize chart appearances.
 Clone this repository to your local machine and navigate into the directory:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/YOUR-REPOSITORY-NAME.git
-cd YOUR-REPOSITORY-NAME
+git clone https://github.com/Captain400xx/restock_predictions.git
+cd restock_predictions
 ```
 
 ---
@@ -49,7 +49,7 @@ You must have a CSV file containing your historical restock data.
 
 - The file must be named **my_restock_data.csv**
 - It must have at least two columns: `DateTime` and `Retailer`
-- Place this file in the same root directory as the `app.py` script
+- Place this file in the same root directory as the `app2.py` script
 
 ---
 
@@ -66,7 +66,7 @@ pip install -r requirements.txt
 Once the dependencies are installed, run the following command:
 
 ```bash
-streamlit run app.py
+streamlit run app2.py
 ```
 
 ---
@@ -95,4 +95,5 @@ The ML models (**LightGBM**, **XGBoost**, **CatBoost**) now use a much richer fe
 
 ## 👨‍💻 Credits
 This application was created and is maintained by **Captain400x**.
+
 
