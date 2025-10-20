@@ -6,4 +6,5 @@ scikit-learn
 lightgbm
 xgboost
 catboost
+cmdstanpy
 pytz
