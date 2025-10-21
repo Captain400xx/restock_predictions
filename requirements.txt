@@ -1,10 +1,10 @@
 streamlit
 pandas
 plotly
-prophet
+prophet==1.1.1
 scikit-learn
 lightgbm
 xgboost
 catboost
-cmdstanpy
 pytz
+cmdstanpy==1.2.0
