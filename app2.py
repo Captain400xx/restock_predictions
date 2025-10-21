@@ -9,6 +9,8 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from prophet import Prophet
+import cmdstanpy
+print("✅ Prophet backend:", cmdstanpy.__version__)
 import lightgbm as lgb
 import xgboost as xgb
 import catboost as cb
@@ -676,3 +678,4 @@ with tabs[6]:
     st.header("🐾 CatBoost Model Details")
     fig_cat = create_forecast_chart(cat_forecast, cat_big, retailer, "CatBoost Forecast", chart_color)
     st.plotly_chart(fig_cat, use_container_width=True)
+
