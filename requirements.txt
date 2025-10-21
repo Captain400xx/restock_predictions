@@ -1,5 +1,6 @@
 streamlit
-pandas
+pandas==1.5.3
+numpy==1.24.3
 plotly
 prophet==1.1.1
 scikit-learn
@@ -8,3 +9,4 @@ xgboost
 catboost
 pytz
 cmdstanpy==1.2.0
+pystan==2.19.1.1
