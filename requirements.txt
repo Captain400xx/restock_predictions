@@ -12,6 +12,5 @@ lightgbm
 xgboost
 catboost
 pytz
-cmdstanpy
+cmdstanpy==1.2.4
 pystan
-
