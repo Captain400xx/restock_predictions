@@ -1,5 +1,5 @@
 # ----------------------------------------------------------------------
-# Pokémon Card Drop Forecast - v7.6 (Branding Update)
+# Pokémon Card Drop Forecast - v7.6 (15-min precision + time-weighting + local tz)
 # ----------------------------------------------------------------------
 
 # -------------------------
@@ -9,6 +9,8 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from prophet import Prophet
+import cmdstanpy
+print("✅ Prophet backend:", cmdstanpy.__version__)
 import lightgbm as lgb
 import xgboost as xgb
 import catboost as cb
@@ -20,18 +22,22 @@ import numpy as np
 import os
 import streamlit.components.v1 as components
 
+# try to import tzlocal for local timezone detection
+try:
+    import tzlocal
+except Exception:
+    tzlocal = None
+
 # Ignore warnings
 warnings.filterwarnings("ignore")
 
 # -------------------------
 # 2. App Configuration & Initial Setup
 # -------------------------
-# --- CHANGE 1: Added page_icon to set the browser tab logo ---
-# Make sure 'logo.png' is in the same folder as this script.
 st.set_page_config(
-    page_title="RestockR Predictions", 
+    page_title="RestockR Predictions",
     page_icon="logo2.png",
-    layout="wide", 
+    layout="wide",
     initial_sidebar_state="expanded"
 )
 
@@ -49,6 +55,7 @@ def load_main_data(file_path):
             if 'DateTime' not in df.columns or 'Retailer' not in df.columns:
                 st.error(f"Error: Your CSV file '{file_path}' must contain 'DateTime' and 'Retailer' columns.")
                 return None
+            # return CSV string (same as before)
             return df.to_csv(index=False)
         except Exception as e:
             st.error(f"Error reading your CSV file: {e}")
@@ -56,10 +63,10 @@ def load_main_data(file_path):
     else:
         st.warning(f"File '{file_path}' not found. Using sample data.")
         default_csv_data = """DateTime,Retailer
-        2025-09-01 10:05,Pokemon Center
-        2025-09-02 14:10,Walmart
-        2025-09-03 11:30,Target
-        """
+2025-09-01 10:05,Pokemon Center
+2025-09-02 14:10,Walmart
+2025-09-03 11:30,Target
+"""
         return default_csv_data
 
 # -------------------------
@@ -67,105 +74,251 @@ def load_main_data(file_path):
 # -------------------------
 @st.cache_data
 def create_features_for_ml(df):
+    # expects df with DateTime and Count already present; DateTime may be index or column
+    if 'DateTime' not in df.columns:
+        df = df.reset_index().rename(columns={'index': 'DateTime'})
     df['DateTime'] = pd.to_datetime(df['DateTime'])
-    df = df.sort_values('DateTime')
+    df = df.sort_values('DateTime').reset_index(drop=True)
+
+    # basic time fields (15-min precision)
     df['hour'] = df['DateTime'].dt.hour
+    df['minute'] = df['DateTime'].dt.minute
+    df['quarter'] = (df['minute'] // 15).astype(int)  # 0..3
     df['dayofweek'] = df['DateTime'].dt.dayofweek
     df['dayofyear'] = df['DateTime'].dt.dayofyear
     df['weekofyear'] = df['DateTime'].dt.isocalendar().week.astype(int)
     df['month'] = df['DateTime'].dt.month
-    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24.0)
-    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24.0)
+
+    # continuous time-of-day feature in minutes for smooth cyclical encodings
+    df['minutes_of_day'] = df['hour'] * 60 + df['minute']
+    df['tod_sin'] = np.sin(2 * np.pi * df['minutes_of_day'] / (24 * 60.0))
+    df['tod_cos'] = np.cos(2 * np.pi * df['minutes_of_day'] / (24 * 60.0))
+
+    # day-of-week cyclical
     df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7.0)
     df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7.0)
+
     df['is_weekend'] = (df['dayofweek'] >= 5).astype(int)
     df['is_business_hours'] = ((df['hour'] >= 9) & (df['hour'] <= 17)).astype(int)
-    df['lag_1h'] = df['Count'].shift(1).fillna(0)
-    df['lag_24h'] = df['Count'].shift(24).fillna(0)
-    df['lag_1w'] = df['Count'].shift(24 * 7).fillna(0)
+
+    # lag features for 15-min resolution:
+    # shift(1) => previous 15 min, shift(4) => previous 1 hour, shift(96) => previous 24 hours
+    df['lag_15m'] = df['Count'].shift(1).fillna(0)
+    df['lag_1h'] = df['Count'].shift(4).fillna(0)
+    df['lag_1d'] = df['Count'].shift(96).fillna(0)
+    df['lag_1w'] = df['Count'].shift(96 * 7).fillna(0)
+
+    # fill any remaining NaNs
+    df.fillna(0, inplace=True)
     return df
 
 @st.cache_data
 def process_data_for_forecasting(csv_data_string):
     df = pd.read_csv(StringIO(csv_data_string))
     df['DateTime'] = pd.to_datetime(df['DateTime'])
+    # Each row = 1 recorded event
     df['Count'] = 1
-    df_hourly = df.set_index('DateTime').groupby('Retailer').resample('H').sum(numeric_only=True).drop(columns='Retailer', errors='ignore').reset_index()
-    all_retailers = df_hourly["Retailer"].unique()
+
+    # Resample to 15-minute intervals per retailer
+    df_15min = (
+        df.set_index('DateTime')
+          .groupby('Retailer')
+          .resample('15T')
+          .sum(numeric_only=True)
+          .reset_index()
+    )
+
+    all_retailers = df_15min["Retailer"].unique()
     processed_dfs = []
     for r in all_retailers:
-        retailer_df = df_hourly[df_hourly["Retailer"] == r].copy()
-        full_range = pd.date_range(start=retailer_df['DateTime'].min(), end=retailer_df['DateTime'].max(), freq='H')
+        retailer_df = df_15min[df_15min["Retailer"] == r].copy()
+        # ensure continuous 15-min index over the observed range
+        full_range = pd.date_range(start=retailer_df['DateTime'].min(), end=retailer_df['DateTime'].max(), freq='15T')
         retailer_df = retailer_df.set_index('DateTime').reindex(full_range).fillna(0).reset_index().rename(columns={'index': 'DateTime'})
         retailer_df['Retailer'] = r
         retailer_featured_df = create_features_for_ml(retailer_df)
         processed_dfs.append(retailer_featured_df)
-    return pd.concat(processed_dfs, ignore_index=True)
-
+    if processed_dfs:
+        return pd.concat(processed_dfs, ignore_index=True)
+    else:
+        return pd.DataFrame(columns=['DateTime', 'Retailer', 'Count'])
 
 def filter_by_time(df, future_only=True):
-    now_eastern = datetime.now(EASTERN)
-    df['ds'] = pd.to_datetime(df['ds']).dt.tz_localize(None)
-    if future_only:
-        return df[df['ds'] >= now_eastern.replace(tzinfo=None)]
-    else:
+    # Ensure ds is timezone-aware in UTC for robust comparisons
+    if df is None or df.empty:
         return df
+    df = df.copy()
+    if 'ds' in df.columns:
+        # if naive, assume UTC
+        if df['ds'].dt.tz is None:
+            df['ds'] = df['ds'].dt.tz_localize(pytz.UTC)
+    now_utc = datetime.now(pytz.UTC)
+    if future_only:
+        return df[df['ds'] >= now_utc]
+    return df
+
+# --- Detect and apply local timezone automatically ---
+def convert_to_local_time(df, time_col='ds'):
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    try:
+        # ensure we start from UTC (Prophet and ML predictions are produced in naive times; treat as UTC)
+        if df[time_col].dt.tz is None:
+            df[time_col] = df[time_col].dt.tz_localize(pytz.UTC)
+        if tzlocal is not None:
+            local_tz = tzlocal.get_localzone()
+        else:
+            # fallback to eastern if tzlocal not installed
+            local_tz = EASTERN
+        df[time_col] = df[time_col].dt.tz_convert(local_tz)
+    except Exception:
+        # best-effort: leave times as-is (naive)
+        try:
+            df[time_col] = pd.to_datetime(df[time_col])
+        except Exception:
+            pass
+    return df
 
 # ----- MODEL TRAINING FUNCTIONS -----
 @st.cache_data
 def train_prophet_model(data, forecast_horizon):
-    df_prophet = data.rename(columns={"DateTime": "ds", "Count": "y"})
+    # data: DataFrame for single retailer with DateTime and Count at 15-min intervals
+    df_prophet = data.rename(columns={"DateTime": "ds", "Count": "y"})[['ds', 'y']].copy()
+    df_prophet['ds'] = pd.to_datetime(df_prophet['ds'])
+    # Prophet expects naive times; we'll treat them as UTC for consistent handling
+    df_prophet['ds'] = df_prophet['ds'].dt.tz_localize(pytz.UTC).dt.tz_convert(pytz.UTC).dt.tz_localize(None)
+
     model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
     model.fit(df_prophet)
-    future = model.make_future_dataframe(periods=forecast_horizon, freq="H")
+    # forecast_horizon is in days; convert to number of 15-min periods
+    periods = forecast_horizon * 24 * 4
+    future = model.make_future_dataframe(periods=periods, freq="15T")
     forecast = model.predict(future)
-    forecast['Weekday'] = forecast['ds'].dt.day_name()
+    # ensure ds is timezone-aware UTC (for consistent downstream conversion)
+    forecast['ds'] = pd.to_datetime(forecast['ds']).dt.tz_localize(pytz.UTC)
+    forecast['Weekday'] = forecast['ds'].dt.tz_convert(pytz.UTC).dt.day_name()
+    # Prophet returns 'yhat' as predictions; normalize to positive
+    forecast['yhat'] = forecast['yhat'].clip(lower=0)
     return model, forecast
 
 @st.cache_data
 def train_ml_model(data, forecast_horizon, model_type='lgbm'):
-    FEATURES = ['hour', 'dayofweek', 'dayofyear', 'weekofyear', 'month','hour_sin', 'hour_cos', 'dayofweek_sin', 'dayofweek_cos','is_weekend', 'is_business_hours', 'lag_1h', 'lag_24h', 'lag_1w']
+    # data: features created by create_features_for_ml
+    FEATURES = ['hour', 'quarter', 'dayofweek', 'dayofyear', 'weekofyear', 'month',
+                'tod_sin', 'tod_cos', 'dayofweek_sin', 'dayofweek_cos',
+                'is_weekend', 'is_business_hours', 'lag_15m', 'lag_1h', 'lag_1d', 'lag_1w']
     TARGET = 'Count'
+
+    data = data.copy()
     X_train = data[FEATURES]
     y_train = data[TARGET]
-    if model_type == 'lgbm': model = lgb.LGBMRegressor(random_state=42, objective='poisson')
-    elif model_type == 'xgb': model = xgb.XGBRegressor(random_state=42, objective='count:poisson')
-    else: model = cb.CatBoostRegressor(random_state=42, loss_function='Poisson', verbose=0)
-    model.fit(X_train, y_train)
+
+    # --- Time-weighted training ---
+    # More recent observations should have higher weight.
+    # compute hours difference from most recent time
+    if 'DateTime' in data.columns:
+        max_time = data['DateTime'].max()
+        data['time_diff_hours'] = (max_time - data['DateTime']).dt.total_seconds() / 3600.0
+    else:
+        data['time_diff_hours'] = 0.0
+    # exponential decay weights; decay_factor controls how fast older data down-weighted
+    decay_factor = 0.002  # tweak as needed: smaller -> slower decay
+    sample_weights = np.exp(-decay_factor * data['time_diff_hours'])
+
+    # --- Model selection ---
+    if model_type == 'lgbm':
+        model = lgb.LGBMRegressor(random_state=42, objective='poisson')
+    elif model_type == 'xgb':
+        model = xgb.XGBRegressor(random_state=42, objective='count:poisson')
+    else:
+        model = cb.CatBoostRegressor(random_state=42, loss_function='Poisson', verbose=0)
+
+    # Fit with sample weights
+    try:
+        model.fit(X_train, y_train, sample_weight=sample_weights)
+    except TypeError:
+        # fallback for models that expect different param name
+        model.fit(X_train, y_train)
+
+    # Build future dates at 15-min resolution
     last_date = data['DateTime'].max()
-    future_dates = pd.date_range(start=last_date, periods=forecast_horizon + 1, freq='H', inclusive='right')
+    # forecast_horizon is in days: multiply by 96 to get 15-min periods
+    periods = forecast_horizon * 24 * 4
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(minutes=15), periods=periods, freq='15T')
     future_df = pd.DataFrame({'DateTime': future_dates})
-    full_history = pd.concat([data.set_index('DateTime'), future_df.set_index('DateTime')]).reset_index()
-    full_history_featured = create_features_for_ml(full_history.rename(columns={'index':'DateTime'}))
+    # create features for both history + future so lag features exist
+    full_history = pd.concat([data.set_index('DateTime'), future_df.set_index('DateTime')], axis=0, sort=False).reset_index()
+    full_history.rename(columns={'index': 'DateTime'}, inplace=True)
+    full_history['Count'] = full_history['Count'].fillna(0)
+    full_history_featured = create_features_for_ml(full_history)
     X_future = full_history_featured.iloc[-len(future_df):][FEATURES]
-    future_df['yhat'] = model.predict(X_future)
+    yhat = model.predict(X_future)
+    future_df['yhat'] = np.clip(yhat, 0, None)
     forecast_df = future_df.rename(columns={'DateTime': 'ds'})
-    forecast_df['ds'] = pd.to_datetime(forecast_df['ds'])
-    forecast_df['Weekday'] = forecast_df['ds'].dt.day_name()
+    # set ds timezone-aware in UTC
+    forecast_df['ds'] = pd.to_datetime(forecast_df['ds']).dt.tz_localize(pytz.UTC)
+    forecast_df['Weekday'] = forecast_df['ds'].dt.tz_convert(pytz.UTC).dt.day_name()
     return model, forecast_df
 
 # ----- ANALYSIS & PLOTTING -----
 def get_big_restocks(forecast_df):
-    forecast_df['yhat'] = forecast_df['yhat'].clip(lower=0)
-    cutoff = forecast_df["yhat"].quantile(0.90)
-    cutoff = max(cutoff, 0.5) 
+    if forecast_df is None or forecast_df.empty:
+        return 0.0, pd.DataFrame()
+    forecast_df = forecast_df.copy()
+    forecast_df['yhat'] = forecast_df.get('yhat', forecast_df.get('yhat', 0)).clip(lower=0)
+    cutoff = forecast_df["yhat"].quantile(0.90) if "yhat" in forecast_df.columns else 0.0
+    cutoff = max(cutoff, 0.5)
     big = forecast_df[forecast_df["yhat"] >= cutoff].copy()
     return cutoff, big.sort_values("ds")
 
 def create_forecast_chart(forecast_df, big_restocks_df, retailer, title, color):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=forecast_df["ds"], y=forecast_df["yhat"], mode="lines", name="Forecast", line=dict(width=2, color=color), hovertemplate='%{x|%Y-%m-%d %H:%M} — %{y:.1f} activity<extra></extra>'))
-    if not big_restocks_df.empty:
-        fig.add_trace(go.Scatter(x=big_restocks_df["ds"], y=big_restocks_df["yhat"], mode="markers", name="Predicted Big Restock", marker=dict(size=10, color='red', symbol='star'), hovertemplate='%{x|%Y-%m-%d %H:%M} — %{y:.1f} activity<extra></extra>'))
-    now_eastern = datetime.now(EASTERN)
-    ymax = max(forecast_df['yhat'].max() * 1.2, 5) if not forecast_df.empty else 5
-    fig.update_layout(title=f"{title} for {retailer}",hovermode="x unified",template="plotly_white",height=500,yaxis=dict(title="Predicted Restock Activity", range=[0, ymax]),xaxis=dict(title="Date (US/Eastern)", tickformat="%a %m/%d", dtick="D1", showgrid=True, gridcolor='rgba(0, 0, 0, 0.1)'),xaxis2=dict(title="Time of Day (ET)", overlaying='x', side='top', tickformat='%I %p', dtick=3600000 * 4, showgrid=True, gridcolor='rgba(255, 0, 0, 0.3)', gridwidth=1, showticklabels=True),shapes=[dict(type='line', x0=now_eastern, y0=0, x1=now_eastern, y1=1, yref='paper', line=dict(color='RoyalBlue', width=2, dash='dash'))],annotations=[dict(x=now_eastern, y=1.05, yref='paper', text='Current Time', showarrow=False)])
+    if forecast_df is None or forecast_df.empty:
+        fig.update_layout(title=f"No forecast available for {retailer}")
+        return fig
+
+    # Ensure ds is tz-aware for display
+    f = forecast_df.copy()
+    if f['ds'].dt.tz is None:
+        f['ds'] = f['ds'].dt.tz_localize(pytz.UTC)
+    # For hover formatting, convert to local timezone for display
+    try:
+        local_tz = tzlocal.get_localzone() if tzlocal is not None else EASTERN
+    except Exception:
+        local_tz = EASTERN
+    display_times = f['ds'].dt.tz_convert(local_tz)
+
+    fig.add_trace(go.Scatter(x=display_times, y=f["yhat"], mode="lines", name="Forecast",
+                             line=dict(width=2, color=color),
+                             hovertemplate='%{x|%Y-%m-%d %H:%M} — %{y:.1f} activity<extra></extra>'))
+    if big_restocks_df is not None and not big_restocks_df.empty:
+        big = big_restocks_df.copy()
+        if big['ds'].dt.tz is None:
+            big['ds'] = big['ds'].dt.tz_localize(pytz.UTC)
+        big_display = big['ds'].dt.tz_convert(local_tz)
+        fig.add_trace(go.Scatter(x=big_display, y=big['yhat'], mode="markers", name="Predicted Big Restock",
+                                 marker=dict(size=10, color='red', symbol='star'),
+                                 hovertemplate='%{x|%Y-%m-%d %H:%M} — %{y:.1f} activity<extra></extra>'))
+
+    now_local = datetime.now(pytz.UTC).astimezone(local_tz)
+    ymax = max(f['yhat'].max() * 1.2, 5) if not f.empty else 5
+    fig.update_layout(
+        title=f"{title} for {retailer}",
+        hovermode="x unified",
+        template="plotly_white",
+        height=500,
+        yaxis=dict(title="Predicted Restock Activity", range=[0, ymax]),
+        xaxis=dict(title=f"Date (Local: {str(local_tz)})", showgrid=True),
+        shapes=[dict(type='line', x0=now_local, y0=0, x1=now_local, y1=1, yref='paper', line=dict(color='RoyalBlue', width=2, dash='dash'))],
+        annotations=[dict(x=now_local, y=1.05, yref='paper', text='Current Time', showarrow=False)]
+    )
     return fig
 
 def display_consensus_schedule(df):
     st.markdown("""<style>.schedule-table { width: 100%; border-collapse: collapse; font-size: 0.9em; } .schedule-table th, .schedule-table td { padding: 8px; text-align: left; border-bottom: 1px solid #444; } .schedule-table th { background-color: #1a1a1a; } .high-confidence { background-color: rgba(40, 167, 69, 0.3); } .medium-confidence { background-color: rgba(255, 193, 7, 0.3); } .low-confidence { background-color: rgba(220, 53, 69, 0.3); } .day-group { font-weight: bold; font-size: 1.1em; padding-top: 15px; }</style>""", unsafe_allow_html=True)
     html = "<table class='schedule-table'>"
-    html += "<tr><th>Time (ET)</th><th>Avg. Activity</th><th>Confidence</th><th>Models in Agreement</th></tr>"
+    html += "<tr><th>Time (Local)</th><th>Avg. Activity</th><th>Confidence</th><th>Models in Agreement</th></tr>"
     if df.empty:
         html += "<tr><td colspan='4' style='text-align:center;'>No significant restocks predicted.</td></tr>"
     else:
@@ -187,21 +340,57 @@ def display_consensus_schedule(df):
 def create_consensus_chart(df):
     if df.empty:
         return go.Figure().update_layout(title="No significant activity predicted.")
+
     color_map = {'High': 'green', 'Medium': 'orange', 'Low': 'red'}
+    df = df.copy()
     df['color'] = df['Confidence'].map(color_map)
-    df['day_label'] = df['time_group'].dt.strftime('%a %m/%d')
-    fig = go.Figure(go.Bar(x=df['time_group'],y=df['avg_activity'],marker_color=df['color'],hovertemplate="<b>%{x|%a, %b %d, %I %p}</b><br>Confidence: %{customdata[0]}<br>Avg. Activity: %{y:.1f}<extra></extra>",customdata=df[['Confidence']]))
-    fig.update_layout(title="Visual Prediction Schedule",xaxis_title="Date & Time (ET)",yaxis_title="Average Predicted Activity",template="plotly_white",height=400,xaxis=dict(type='category',tickmode='array',tickvals=df['time_group'],ticktext=df['day_label']))
+
+    # --- Create hierarchical labels ---
+    # Level 1 (Top label): "Tue, Oct 21"
+    df['day_label_L1'] = df['time_group'].dt.strftime('%a, %b %d')
+    # Level 2 (Bottom label): "02:00 PM"
+    df['day_label_L2'] = df['time_group'].dt.strftime('%I:%M %p')
+    # --- End label creation ---
+
+    fig = go.Figure(go.Bar(
+        # Pass BOTH columns to 'x' to create the hierarchy
+        x=[df['day_label_L1'], df['day_label_L2']], 
+        y=df['avg_activity'], 
+        marker_color=df['color'],
+        # Update hovertemplate to show both parts of the x-axis
+        hovertemplate="<b>%{x[0]}<br>%{x[1]}</b><br>Confidence: %{customdata[0]}<br>Avg. Activity: %{y:.1f}<extra></extra>",
+        customdata=df[['Confidence']]
+    ))
+
+    fig.update_layout(
+        title="Visual Prediction Schedule", 
+        xaxis_title="Predicted Event Time (Local)", 
+        yaxis_title="Average Predicted Activity", 
+        template="plotly_white", 
+        height=400,
+        # This helps keep the labels clean
+        xaxis=dict(tickfont=dict(size=10)) 
+    )
     return fig
-    
+
 def create_importance_chart(df):
-    fig = go.Figure(go.Bar(x=df['Importance'],y=df['Feature'],orientation='h'))
-    fig.update_layout(title="Model Feature Importance (All Models)",xaxis_title="Average Importance",yaxis_title="Feature",template="plotly_white",yaxis=dict(autorange="reversed"),height=400)
+    fig = go.Figure(go.Bar(x=df['Importance'], y=df['Feature'], orientation='h'))
+    fig.update_layout(title="Model Feature Importance (All Models)", xaxis_title="Average Importance", yaxis_title="Feature", template="plotly_white", yaxis=dict(autorange="reversed"), height=400)
     return fig
 
 def create_calendar_heatmap(forecast_df, retailer):
+    if forecast_df is None or forecast_df.empty:
+        return go.Figure().update_layout(title="No data")
     df = forecast_df.copy()
-    df['date'] = df['ds'].dt.date
+    # convert to local for nicer date labels
+    try:
+        local_tz = tzlocal.get_localzone() if tzlocal is not None else EASTERN
+    except Exception:
+        local_tz = EASTERN
+    if df['ds'].dt.tz is None:
+        df['ds'] = df['ds'].dt.tz_localize(pytz.UTC)
+    df['local_ds'] = df['ds'].dt.tz_convert(local_tz)
+    df['date'] = df['local_ds'].dt.date
     daily_max = df.groupby('date')['yhat'].max().reset_index()
     daily_max['day_of_week'] = pd.to_datetime(daily_max['date']).dt.dayofweek
     daily_max['week_of_year'] = pd.to_datetime(daily_max['date']).dt.isocalendar().week
@@ -215,27 +404,37 @@ def create_calendar_heatmap(forecast_df, retailer):
             day_idx = row['day_of_week']
             heatmap_data[day_idx, week_idx] = row['yhat']
             text_data[day_idx, week_idx] = row['day_str']
-        except (IndexError, ValueError): continue
+        except (IndexError, ValueError):
+            continue
     fig = go.Figure(data=go.Heatmap(z=heatmap_data, x=[f"Week {w}" for w in weeks], y=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], hoverongaps=False, text=text_data, texttemplate="%{text}", colorscale='Oranges', colorbar_title='Max Activity'))
     fig.update_layout(title=f"Daily Activity Heatmap for {retailer}", xaxis_title="Week of the Year", height=400)
     return fig
 
 def create_hourly_heatmap(forecast_df, retailer):
+    if forecast_df is None or forecast_df.empty:
+        return go.Figure().update_layout(title="No data")
     df = forecast_df.copy()
-    df['hour'] = df['ds'].dt.hour
-    df['dayofweek'] = df['ds'].dt.dayofweek
+    # convert to local for consistent hour labels
+    try:
+        local_tz = tzlocal.get_localzone() if tzlocal is not None else EASTERN
+    except Exception:
+        local_tz = EASTERN
+    if df['ds'].dt.tz is None:
+        df['ds'] = df['ds'].dt.tz_localize(pytz.UTC)
+    df['local_ds'] = df['ds'].dt.tz_convert(local_tz)
+    df['hour'] = df['local_ds'].dt.hour
+    df['dayofweek'] = df['local_ds'].dt.dayofweek
     hourly_avg = df.groupby(['dayofweek', 'hour'])['yhat'].mean().reset_index()
-    heatmap_data = hourly_avg.pivot(index='dayofweek', columns='hour', values='yhat')
+    heatmap_data = hourly_avg.pivot(index='dayofweek', columns='hour', values='yhat').reindex(index=range(7), columns=range(24))
     day_labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
     hour_labels = [f"{h}:00" for h in range(24)]
-    fig = go.Figure(data=go.Heatmap(z=heatmap_data.values,x=hour_labels,y=day_labels,colorscale='Oranges',colorbar_title='Avg. Activity'))
-    fig.update_layout(title=f"Hourly Activity Heatmap for {retailer}", xaxis_title="Hour of Day (ET)", yaxis_title="Day of Week", height=500)
+    fig = go.Figure(data=go.Heatmap(z=heatmap_data.values, x=hour_labels, y=day_labels, colorscale='Oranges', colorbar_title='Avg. Activity'))
+    fig.update_layout(title=f"Hourly Activity Heatmap for {retailer}", xaxis_title="Hour of Day (Local)", yaxis_title="Day of Week", height=500)
     return fig
 
 # -------------------------
 # 5. Main App Logic
 # -------------------------
-# --- CHANGE 2: Use columns to create a title with a logo ---
 col1, col2 = st.columns([1, 8])
 with col1:
     if os.path.exists("logo2.png"):
@@ -244,23 +443,27 @@ with col2:
     st.title("RestockR Predictions: Pokemon Card Restock Forecast")
 
 raw_data_string = load_main_data(DATA_FILE)
-if raw_data_string is None: st.stop()
+if raw_data_string is None:
+    st.stop()
 full_df = process_data_for_forecasting(raw_data_string)
 
 with st.expander("👋 How to Use This App", expanded=True):
     st.markdown("""
-    This app forecasts Pokémon card restock activity using four different models.
+    This app forecasts Pokémon card restock activity using multiple models.
     - **Select a Retailer:** Use the dropdown in the sidebar.
-    - **Set the Forecast Horizon:** Use the slider to decide how far into the future to predict.
-    - **Explore the Tabs:**
+    - **Set the Forecast Horizon:** Use the slider to decide how far into the future to predict. Up to 30 days
+     - **Explore the Tabs:**
         - **⭐ Prediction Schedule:** A visual schedule of high-confidence predictions.
         - **📅 2-Week View:** A chart to check model accuracy against the past week's data.
         - **📊 Analysis:** Heatmaps showing the hottest days and times for restocks.
         - **Model Tabs (Prophet, etc.):** Dive deep into the forecast of each individual model.
 
-    **What is 'Predicted Restock Activity'?** Since we are counting every restock event as '1', the model forecasts the **frequency of restock events per hour**.
-    - A **low** score (e.g., 0-1) means no or very few restock events are expected.
-    - A **high** score (e.g., 5+) means the model predicts a cluster of many separate restock events in that hour.
+
+         **What is 'Predicted Restock Activity'?** Since we are counting every restock event as '1', the model forecasts the **frequency of restock events per hour**.
+         - A **low** score (e.g., 0-1) means no or very few restock events are expected.
+         - A **high** score (e.g., 5+) means the model predicts a cluster of many separate restock events in that hour.
+
+    Note: Predictions are now at 15-minute precision. Models are time-weighted to emphasize recent data.
     """)
 
 # -------------------------
@@ -270,22 +473,27 @@ st.markdown("""<style>[data-testid="stSidebar"] > div:first-child {padding-top: 
 
 st.sidebar.title("⚙️ Controls")
 retailers = sorted(full_df["Retailer"].unique().tolist())
-if not retailers: st.error("No retailers found."); st.stop()
+if not retailers:
+    st.error("No retailers found.")
+    st.stop()
 
 default_index = 0
-if 'Target' in retailers: default_index = retailers.index('Target')
+if 'Target' in retailers:
+    default_index = retailers.index('Target')
 retailer = st.sidebar.selectbox("Choose a retailer to forecast", retailers, index=default_index, label_visibility="collapsed")
 
 st.sidebar.markdown("---")
-forecast_horizon = st.sidebar.slider("Forecast Horizon (days)", 7, 30, 14, 1)
-forecast_hours = forecast_horizon * 24 
+forecast_horizon = st.sidebar.slider("Forecast Horizon (days)", 1, 30, 14, 1)
+forecast_hours = forecast_horizon * 24
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Data Summary")
 retailer_history_df = full_df[full_df['Retailer'] == retailer]
-min_date = retailer_history_df['DateTime'].min().strftime('%b %d, %Y')
-max_date = retailer_history_df['DateTime'].max().strftime('%b %d, %Y')
-event_count = int(retailer_history_df['Count'].sum())
+if retailer_history_df.empty:
+    st.sidebar.info("Selected retailer has no data.")
+min_date = retailer_history_df['DateTime'].min().strftime('%b %d, %Y') if not retailer_history_df.empty else "N/A"
+max_date = retailer_history_df['DateTime'].max().strftime('%b %d, %Y') if not retailer_history_df.empty else "N/A"
+event_count = int(retailer_history_df['Count'].sum()) if not retailer_history_df.empty else 0
 st.sidebar.markdown(f"""<div style="font-size: 0.9em;">Data Available From: <strong style="font-size: 1.1em;">{min_date}</strong><br>Data Available To: <strong style="font-size: 1.1em;">{max_date}</strong><br>Total Recorded Events: <strong style="font-size: 1.1em;">{event_count:,}</strong></div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("---")
@@ -295,53 +503,85 @@ chart_color = st.sidebar.color_picker("Forecast Line Color", "#FFA500")
 st.sidebar.markdown("**Next High-Confidence Alert:**")
 countdown_placeholder = st.sidebar.empty()
 st.sidebar.markdown("---")
-if os.path.exists("logo.png"): st.sidebar.image("logo.png", width=100)
+if os.path.exists("logo.png"):
+    st.sidebar.image("logo.png", width=100)
 st.sidebar.warning("This data is the property of RestockR Monitors. Unauthorized sharing, distribution, or external use of this information may result in penalties or legal action.")
 st.sidebar.markdown("---")
-st.sidebar.markdown("App by **Captain400x**")
+st.sidebar.markdown("Developed by **Captain400x**")
 
 retailer_df = full_df[full_df["Retailer"] == retailer].copy()
 
 # --- Run All Models & Generate Consensus ---
 with st.spinner("Training models with advanced features... this may take a moment."):
-    prophet_model, prophet_forecast_raw = train_prophet_model(retailer_df, forecast_hours)
-    xgb_model, xgb_forecast_raw = train_ml_model(retailer_df, forecast_hours, model_type='xgb')
-    lgbm_model, lgbm_forecast_raw = train_ml_model(retailer_df, forecast_hours, model_type='lgbm')
-    cat_model, cat_forecast_raw = train_ml_model(retailer_df, forecast_hours, model_type='catboost')
-    
-    FEATURES = ['hour', 'dayofweek', 'dayofyear', 'weekofyear', 'month','hour_sin', 'hour_cos', 'dayofweek_sin', 'dayofweek_cos','is_weekend', 'is_business_hours', 'lag_1h', 'lag_24h', 'lag_1w']
-    lgbm_imp = lgbm_model.feature_importances_
-    xgb_imp = xgb_model.feature_importances_
-    cat_imp = cat_model.feature_importances_
-    avg_imp = (lgbm_imp/lgbm_imp.sum() + xgb_imp/xgb_imp.sum() + cat_imp/cat_imp.sum()) / 3
-    importance_df = pd.DataFrame({'Feature': FEATURES, 'Importance': avg_imp}).sort_values('Importance', ascending=False)
+    prophet_model, prophet_forecast_raw = train_prophet_model(retailer_df, forecast_horizon)
+    xgb_model, xgb_forecast_raw = train_ml_model(retailer_df, forecast_horizon, model_type='xgb')
+    lgbm_model, lgbm_forecast_raw = train_ml_model(retailer_df, forecast_horizon, model_type='lgbm')
+    cat_model, cat_forecast_raw = train_ml_model(retailer_df, forecast_horizon, model_type='catboost')
 
+    FEATURES = ['hour', 'quarter', 'dayofweek', 'dayofyear', 'weekofyear', 'month',
+                'tod_sin', 'tod_cos', 'dayofweek_sin', 'dayofweek_cos',
+                'is_weekend', 'is_business_hours', 'lag_15m', 'lag_1h', 'lag_1d', 'lag_1w']
+    try:
+        lgbm_imp = lgbm_model.feature_importances_
+        xgb_imp = xgb_model.feature_importances_
+        cat_imp = cat_model.feature_importances_
+        avg_imp = (lgbm_imp / lgbm_imp.sum() + xgb_imp / xgb_imp.sum() + cat_imp / cat_imp.sum()) / 3
+        importance_df = pd.DataFrame({'Feature': FEATURES, 'Importance': avg_imp}).sort_values('Importance', ascending=False)
+    except Exception:
+        importance_df = pd.DataFrame({'Feature': FEATURES, 'Importance': [1 / len(FEATURES)] * len(FEATURES)}).sort_values('Importance', ascending=False)
 
+# Filter only future predictions (in UTC) and convert to local for display
 prophet_forecast = filter_by_time(prophet_forecast_raw)
 xgb_forecast = filter_by_time(xgb_forecast_raw)
 lgbm_forecast = filter_by_time(lgbm_forecast_raw)
 cat_forecast = filter_by_time(cat_forecast_raw)
 
-_, prophet_big = get_big_restocks(prophet_forecast)
-_, xgb_big = get_big_restocks(xgb_forecast)
-_, lgbm_big = get_big_restocks(lgbm_forecast)
-_, cat_big = get_big_restocks(cat_forecast)
+# Convert all forecast times to viewer's local timezone for display and charting
+prophet_forecast = convert_to_local_time(prophet_forecast) if prophet_forecast is not None else prophet_forecast
+xgb_forecast = convert_to_local_time(xgb_forecast) if xgb_forecast is not None else xgb_forecast
+lgbm_forecast = convert_to_local_time(lgbm_forecast) if lgbm_forecast is not None else lgbm_forecast
+cat_forecast = convert_to_local_time(cat_forecast) if cat_forecast is not None else cat_forecast
+
+# But keep copies of UTC forecasts for consensus logic (use UTC internally)
+prophet_utc = filter_by_time(prophet_forecast_raw)
+xgb_utc = filter_by_time(xgb_forecast_raw)
+lgbm_utc = filter_by_time(lgbm_forecast_raw)
+cat_utc = filter_by_time(cat_forecast_raw)
+
+_, prophet_big = get_big_restocks(prophet_utc)
+_, xgb_big = get_big_restocks(xgb_utc)
+_, lgbm_big = get_big_restocks(lgbm_utc)
+_, cat_big = get_big_restocks(cat_utc)
 
 all_big_restocks = []
-for _, row in prophet_big.iterrows(): all_big_restocks.append({'ds': row['ds'], 'model': 'Prophet', 'yhat': row['yhat']})
-for _, row in xgb_big.iterrows(): all_big_restocks.append({'ds': row['ds'], 'model': 'XGBoost', 'yhat': row['yhat']})
-for _, row in lgbm_big.iterrows(): all_big_restocks.append({'ds': row['ds'], 'model': 'LightGBM', 'yhat': row['yhat']})
-for _, row in cat_big.iterrows(): all_big_restocks.append({'ds': row['ds'], 'model': 'CatBoost', 'yhat': row['yhat']})
+for _, row in prophet_big.iterrows():
+    all_big_restocks.append({'ds': row['ds'], 'model': 'Prophet', 'yhat': row['yhat']})
+for _, row in xgb_big.iterrows():
+    all_big_restocks.append({'ds': row['ds'], 'model': 'XGBoost', 'yhat': row['yhat']})
+for _, row in lgbm_big.iterrows():
+    all_big_restocks.append({'ds': row['ds'], 'model': 'LightGBM', 'yhat': row['yhat']})
+for _, row in cat_big.iterrows():
+    all_big_restocks.append({'ds': row['ds'], 'model': 'CatBoost', 'yhat': row['yhat']})
 
 if all_big_restocks:
     consensus_df = pd.DataFrame(all_big_restocks).sort_values('ds').reset_index(drop=True)
+    # Round to nearest 3 hours originally; with 15-min precision we group to nearest 15 min *or* keep as-is.
+    # We'll round to nearest 15 minutes to group model agreement windows
     consensus_df['time_group'] = consensus_df['ds'].dt.round('3H')
-    consensus_summary = consensus_df.groupby('time_group').agg(models=('model', lambda x: ', '.join(sorted(x.unique()))), model_count=('model', 'nunique'), avg_activity=('yhat', 'mean')).reset_index()
+    consensus_summary = consensus_df.groupby('time_group').agg(
+        models=('model', lambda x: ', '.join(sorted(x.unique()))),
+        model_count=('model', 'nunique'),
+        avg_activity=('yhat', 'mean')
+    ).reset_index()
     def get_confidence(count):
-        if count >= 3: return "High"
-        if count == 2: return "Medium"
+        if count >= 3:
+            return "High"
+        if count == 2:
+            return "Medium"
         return "Low"
     consensus_summary['Confidence'] = consensus_summary['model_count'].apply(get_confidence)
+    # For display, convert the UTC time_group to local tz
+    consensus_summary['time_group'] = convert_to_local_time(consensus_summary.rename(columns={'time_group': 'ds'}), time_col='ds')['ds'].dt.tz_convert(tzlocal.get_localzone() if tzlocal else EASTERN)
     consensus_summary = consensus_summary.sort_values('time_group', ascending=True)
 else:
     consensus_summary = pd.DataFrame()
@@ -351,18 +591,20 @@ st.markdown("---")
 st.subheader("🚀 Top Prediction")
 if not consensus_summary.empty and "High" in consensus_summary['Confidence'].values:
     top_pred = consensus_summary[consensus_summary['Confidence'] == 'High'].iloc[0]
-    time_str = top_pred['time_group'].strftime('%A, %b %d at %I %p')
-    
+    time_str = top_pred['time_group'].strftime('%A, %b %d at %I:%M %p')
     st.success(f"**Next High-Confidence Restock Window:** Around **{time_str}**\n- **Models in Agreement:** {top_pred['models']}\n- **Average Predicted Activity:** {top_pred['avg_activity']:.1f}")
-    
-    now_eastern = datetime.now(EASTERN)
-    target_time_naive = top_pred['time_group']
-    if target_time_naive.tzinfo is None:
-        target_time_aware = EASTERN.localize(target_time_naive)
-    else:
-        target_time_aware = target_time_naive.astimezone(EASTERN)
-    target_timestamp_ms = int(target_time_aware.timestamp() * 1000)
-    
+
+    # Countdown: target_time is already localized
+    target_time = top_pred['time_group']
+    if target_time.tzinfo is None:
+        # assume local tz
+        try:
+            local_tz = tzlocal.get_localzone() if tzlocal is not None else EASTERN
+        except Exception:
+            local_tz = EASTERN
+        target_time = pytz.timezone(str(local_tz)).localize(target_time)
+    target_timestamp_ms = int(target_time.timestamp() * 1000)
+
     js_countdown = f"""<h2 id="countdown" style="text-align: left; font-weight: bold; color: #28a745;"></h2><script>var targetTime = {target_timestamp_ms}; function updateCountdown() {{ var now = new Date().getTime(); var diff = targetTime - now; if (diff <= 0) {{ document.getElementById("countdown").innerHTML = "Event in Progress"; clearInterval(interval); return; }} var d = Math.floor(diff / (1000 * 60 * 60 * 24)); var h = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60)); var m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60)); var s = Math.floor((diff % (1000 * 60)) / 1000); document.getElementById("countdown").innerHTML = d + "d " + h + "h " + m + "m " + s + "s"; }} var interval = setInterval(updateCountdown, 1000); updateCountdown(); </script>"""
     with countdown_placeholder.container():
         components.html(js_countdown, height=75)
@@ -384,30 +626,36 @@ with tabs[0]:
 
 with tabs[1]:
     st.header("2-Week Accuracy Check (Past vs. Future)")
-    st.markdown("This chart shows how well the **Prophet model's forecast (line)** matched the **actual historical data (line)** for the past 7 days, giving you a guide for how to interpret the next 7 days.")
-    now = datetime.now(EASTERN)
+    st.markdown("This chart shows how well the **Prophet model's forecast (line)** matched the **actual historical data (line)** for the past 7 days.")
+    now = datetime.now(pytz.UTC)
     start_date = now - timedelta(days=7)
     end_date = now + timedelta(days=7)
-    history_in_window = retailer_history_df[(retailer_history_df['DateTime'] >= start_date.replace(tzinfo=None)) & (retailer_history_df['DateTime'] <= now.replace(tzinfo=None))]
+    # convert retailer history (which is in naive DateTime) to UTC-aware for comparison
+    history_in_window = retailer_history_df.copy()
+    history_in_window['DateTime'] = pd.to_datetime(history_in_window['DateTime'])
+    history_in_window = history_in_window[(history_in_window['DateTime'] >= (start_date.astimezone(pytz.UTC).replace(tzinfo=None))) & (history_in_window['DateTime'] <= (now.astimezone(pytz.UTC).replace(tzinfo=None)))]
     prophet_full_forecast = filter_by_time(prophet_forecast_raw, future_only=False)
-    forecast_in_window = prophet_full_forecast[(prophet_full_forecast['ds'] >= start_date.replace(tzinfo=None)) & (prophet_full_forecast['ds'] <= end_date.replace(tzinfo=None))]
+    # convert prophet_full_forecast to local for plotting
+    prophet_full_local = convert_to_local_time(prophet_full_forecast) if prophet_full_forecast is not None else prophet_full_forecast
+    forecast_in_window = prophet_full_local[(prophet_full_local['ds'] >= start_date) & (prophet_full_local['ds'] <= end_date)]
     fig_2_week = go.Figure()
     fig_2_week.add_trace(go.Scatter(x=history_in_window['DateTime'], y=history_in_window['Count'], mode='lines', name='Actual Past Activity', line=dict(color='blue', width=2)))
     fig_2_week.add_trace(go.Scatter(x=forecast_in_window['ds'], y=forecast_in_window['yhat'], mode='lines', name='Forecast', line=dict(color=chart_color, width=3, dash='dot')))
-    fig_2_week.add_shape(type="line",x0=now.replace(tzinfo=None), x1=now.replace(tzinfo=None),y0=0, y1=1,yref="paper",line=dict(color="red", width=3, dash="dash"))
-    fig_2_week.add_annotation(x=now.replace(tzinfo=None), y=1.05, yref="paper", text="Current Time", showarrow=False)
+    now_local_for_plot = datetime.now(pytz.UTC).astimezone(tzlocal.get_localzone() if tzlocal else EASTERN)
+    fig_2_week.add_shape(type="line", x0=now_local_for_plot, x1=now_local_for_plot, y0=0, y1=1, yref="paper", line=dict(color="red", width=3, dash="dash"))
+    fig_2_week.add_annotation(x=now_local_for_plot, y=1.05, yref="paper", text="Current Time", showarrow=False)
     fig_2_week.update_layout(title=f"Past Week vs. Next Week Forecast for {retailer}", xaxis_title="Date", yaxis_title="Restock Activity", template="plotly_white", height=500)
     st.plotly_chart(fig_2_week, use_container_width=True)
 
 with tabs[2]:
     st.header("Analysis Heatmaps")
-    st.markdown("These charts show the typical patterns of restock activity, based on the **Prophet model's forecast**.")
+    st.markdown("These charts show the typical patterns of restock activity, based on model forecasts.")
     st.subheader("Daily Activity Heatmap")
-    if not prophet_forecast.empty:
+    if prophet_forecast is not None and not prophet_forecast.empty:
         calendar_fig = create_calendar_heatmap(prophet_forecast, retailer)
         st.plotly_chart(calendar_fig, use_container_width=True)
     st.subheader("Hourly Activity Heatmap")
-    if not prophet_forecast.empty:
+    if prophet_forecast is not None and not prophet_forecast.empty:
         hourly_fig = create_hourly_heatmap(prophet_forecast, retailer)
         st.plotly_chart(hourly_fig, use_container_width=True)
     st.subheader("Model Feature Importance")
@@ -430,3 +678,4 @@ with tabs[6]:
     st.header("🐾 CatBoost Model Details")
     fig_cat = create_forecast_chart(cat_forecast, cat_big, retailer, "CatBoost Forecast", chart_color)
     st.plotly_chart(fig_cat, use_container_width=True)
+
