@@ -22,11 +22,6 @@ import numpy as np
 import os
 import streamlit.components.v1 as components
 
-# try to import tzlocal for local timezone detection
-try:
-    import tzlocal
-except Exception:
-    tzlocal = None
 
 # Ignore warnings
 warnings.filterwarnings("ignore")
@@ -89,6 +84,11 @@ def create_features_for_ml(df):
     df['weekofyear'] = df['DateTime'].dt.isocalendar().week.astype(int)
     df['month'] = df['DateTime'].dt.month
 
+    # feature: minutes since last restock event
+    df['minutes_since_last'] = df['DateTime'].diff().dt.total_seconds().div(60).fillna(0)
+
+
+
     # continuous time-of-day feature in minutes for smooth cyclical encodings
     df['minutes_of_day'] = df['hour'] * 60 + df['minute']
     df['tod_sin'] = np.sin(2 * np.pi * df['minutes_of_day'] / (24 * 60.0))
@@ -107,6 +107,12 @@ def create_features_for_ml(df):
     df['lag_1h'] = df['Count'].shift(4).fillna(0)
     df['lag_1d'] = df['Count'].shift(96).fillna(0)
     df['lag_1w'] = df['Count'].shift(96 * 7).fillna(0)
+
+    # rolling mean features to capture short-term trends
+    df['rolling_1h_mean'] = df['Count'].rolling(4, min_periods=1).mean()
+    df['rolling_3h_mean'] = df['Count'].rolling(12, min_periods=1).mean()
+    df['rolling_1d_mean'] = df['Count'].rolling(96, min_periods=1).mean()
+
 
     # fill any remaining NaNs
     df.fillna(0, inplace=True)
@@ -158,27 +164,31 @@ def filter_by_time(df, future_only=True):
     return df
 
 # --- Detect and apply local timezone automatically ---
-def convert_to_local_time(df, time_col='ds'):
+def convert_to_local_time(df, time_col='ds', tz_str='UTC'):
+    """
+    Convert df[time_col] (which should be UTC-aware or naive UTC) to the given tz_str (pytz name).
+    Returns a copy with time_col converted to tz-aware times in tz_str.
+    """
     if df is None or df.empty:
         return df
     df = df.copy()
     try:
-        # ensure we start from UTC (Prophet and ML predictions are produced in naive times; treat as UTC)
+        # ensure it's datetime
+        df[time_col] = pd.to_datetime(df[time_col])
+        # if naive, assume UTC
         if df[time_col].dt.tz is None:
             df[time_col] = df[time_col].dt.tz_localize(pytz.UTC)
-        if tzlocal is not None:
-            local_tz = tzlocal.get_localzone()
-        else:
-            # fallback to eastern if tzlocal not installed
-            local_tz = EASTERN
+        # convert to requested timezone
+        local_tz = pytz.timezone(tz_str)
         df[time_col] = df[time_col].dt.tz_convert(local_tz)
     except Exception:
-        # best-effort: leave times as-is (naive)
+        # best-effort fallback: keep as naive datetimes
         try:
             df[time_col] = pd.to_datetime(df[time_col])
         except Exception:
             pass
     return df
+
 
 # ----- MODEL TRAINING FUNCTIONS -----
 @st.cache_data
@@ -189,7 +199,37 @@ def train_prophet_model(data, forecast_horizon):
     # Prophet expects naive times; we'll treat them as UTC for consistent handling
     df_prophet['ds'] = df_prophet['ds'].dt.tz_localize(pytz.UTC).dt.tz_convert(pytz.UTC).dt.tz_localize(None)
 
-    model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
+    # --- IMPROVED Prophet Model SETUP ---
+    # Step 1: Smooth data slightly for better signal
+    df_prophet['y'] = df_prophet['y'].rolling(2, min_periods=1).mean()
+
+    # Step 2: Define known special events (optional – you can add real Pokémon launch dates here)
+    holidays = pd.DataFrame({
+        'holiday': 'release_day',
+        'ds': pd.to_datetime([
+            '2025-02-09',  # example release dates
+            '2025-05-10',
+            '2025-08-20'
+        ])
+    })
+
+    # Step 3: Initialize Prophet with better tuning
+    model = Prophet(
+        yearly_seasonality=False,
+        weekly_seasonality=True,
+        daily_seasonality=True,
+        holidays=holidays,
+        changepoint_prior_scale=0.15,     # allows moderate flexibility
+        seasonality_prior_scale=10.0,     # stronger cycles
+        interval_width=0.9
+    )
+
+    # Step 4: Add finer seasonality cycles
+    model.add_seasonality(name='hourly', period=1, fourier_order=10)
+    model.add_seasonality(name='3hourly', period=3, fourier_order=8)
+
+
+
     model.fit(df_prophet)
     # forecast_horizon is in days; convert to number of 15-min periods
     periods = forecast_horizon * 24 * 4
@@ -282,12 +322,9 @@ def create_forecast_chart(forecast_df, big_restocks_df, retailer, title, color):
     f = forecast_df.copy()
     if f['ds'].dt.tz is None:
         f['ds'] = f['ds'].dt.tz_localize(pytz.UTC)
-    # For hover formatting, convert to local timezone for display
-    try:
-        local_tz = tzlocal.get_localzone() if tzlocal is not None else EASTERN
-    except Exception:
-        local_tz = EASTERN
-    display_times = f['ds'].dt.tz_convert(local_tz)
+    
+    display_times = f['ds'].dt.tz_convert(pytz.timezone(selected_tz))
+
 
     fig.add_trace(go.Scatter(x=display_times, y=f["yhat"], mode="lines", name="Forecast",
                              line=dict(width=2, color=color),
@@ -296,12 +333,12 @@ def create_forecast_chart(forecast_df, big_restocks_df, retailer, title, color):
         big = big_restocks_df.copy()
         if big['ds'].dt.tz is None:
             big['ds'] = big['ds'].dt.tz_localize(pytz.UTC)
-        big_display = big['ds'].dt.tz_convert(local_tz)
+        big_display = big['ds'].dt.tz_convert(pytz.timezone(selected_tz))
         fig.add_trace(go.Scatter(x=big_display, y=big['yhat'], mode="markers", name="Predicted Big Restock",
                                  marker=dict(size=10, color='red', symbol='star'),
                                  hovertemplate='%{x|%Y-%m-%d %H:%M} — %{y:.1f} activity<extra></extra>'))
 
-    now_local = datetime.now(pytz.UTC).astimezone(local_tz)
+    now_local = datetime.now(pytz.UTC).astimezone(pytz.timezone(selected_tz))
     ymax = max(f['yhat'].max() * 1.2, 5) if not f.empty else 5
     fig.update_layout(
         title=f"{title} for {retailer}",
@@ -309,7 +346,7 @@ def create_forecast_chart(forecast_df, big_restocks_df, retailer, title, color):
         template="plotly_white",
         height=500,
         yaxis=dict(title="Predicted Restock Activity", range=[0, ymax]),
-        xaxis=dict(title=f"Date (Local: {str(local_tz)})", showgrid=True),
+        xaxis=dict(title=f"Date (Local: {selected_tz})", showgrid=True),
         shapes=[dict(type='line', x0=now_local, y0=0, x1=now_local, y1=1, yref='paper', line=dict(color='RoyalBlue', width=2, dash='dash'))],
         annotations=[dict(x=now_local, y=1.05, yref='paper', text='Current Time', showarrow=False)]
     )
@@ -384,12 +421,13 @@ def create_calendar_heatmap(forecast_df, retailer):
     df = forecast_df.copy()
     # convert to local for nicer date labels
     try:
-        local_tz = tzlocal.get_localzone() if tzlocal is not None else EASTERN
+        display_times = df['ds'].dt.tz_convert(pytz.timezone(selected_tz))
     except Exception:
-        local_tz = EASTERN
+        pass
+
     if df['ds'].dt.tz is None:
         df['ds'] = df['ds'].dt.tz_localize(pytz.UTC)
-    df['local_ds'] = df['ds'].dt.tz_convert(local_tz)
+    df['local_ds'] = df['ds'].dt.tz_convert(pytz.timezone(selected_tz))
     df['date'] = df['local_ds'].dt.date
     daily_max = df.groupby('date')['yhat'].max().reset_index()
     daily_max['day_of_week'] = pd.to_datetime(daily_max['date']).dt.dayofweek
@@ -416,12 +454,13 @@ def create_hourly_heatmap(forecast_df, retailer):
     df = forecast_df.copy()
     # convert to local for consistent hour labels
     try:
-        local_tz = tzlocal.get_localzone() if tzlocal is not None else EASTERN
+        display_times = df['ds'].dt.tz_convert(pytz.timezone(selected_tz))
     except Exception:
-        local_tz = EASTERN
+        pass
+
     if df['ds'].dt.tz is None:
         df['ds'] = df['ds'].dt.tz_localize(pytz.UTC)
-    df['local_ds'] = df['ds'].dt.tz_convert(local_tz)
+    df['local_ds'] = df['ds'].dt.tz_convert(pytz.timezone(selected_tz))
     df['hour'] = df['local_ds'].dt.hour
     df['dayofweek'] = df['local_ds'].dt.dayofweek
     hourly_avg = df.groupby(['dayofweek', 'hour'])['yhat'].mean().reset_index()
@@ -440,7 +479,18 @@ with col1:
     if os.path.exists("logo2.png"):
         st.image("logo2.png", width=100)
 with col2:
-    st.title("RestockR Predictions: Pokemon Card Restock Forecast")
+    st.markdown(
+        """
+        <h1 style='font-size:48px; font-weight:900;'>
+            <span style='color:#00C46A;'>Restock</span><span style='color:#FF4B4B;'>R</span>
+            <span style='color:#00C46A;'> Predictions</span>
+        </h1>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+
 
 raw_data_string = load_main_data(DATA_FILE)
 if raw_data_string is None:
@@ -482,12 +532,13 @@ if 'Target' in retailers:
     default_index = retailers.index('Target')
 retailer = st.sidebar.selectbox("Choose a retailer to forecast", retailers, index=default_index, label_visibility="collapsed")
 
-st.sidebar.markdown("---")
 forecast_horizon = st.sidebar.slider("Forecast Horizon (days)", 1, 30, 14, 1)
 forecast_hours = forecast_horizon * 24
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Data Summary")
+st.sidebar.markdown("**Next High-Confidence Alert:**")
+countdown_placeholder = st.sidebar.empty()
 retailer_history_df = full_df[full_df['Retailer'] == retailer]
 if retailer_history_df.empty:
     st.sidebar.info("Selected retailer has no data.")
@@ -498,10 +549,32 @@ st.sidebar.markdown(f"""<div style="font-size: 0.9em;">Data Available From: <str
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Chart Customization")
-chart_color = st.sidebar.color_picker("Forecast Line Color", "#FFA500")
 
-st.sidebar.markdown("**Next High-Confidence Alert:**")
-countdown_placeholder = st.sidebar.empty()
+chart_color = "#FFA500"  # default orange/yellow
+
+# -------------------------
+# Sidebar timezone selector (add this near your other sidebar controls)
+# -------------------------
+import pytz
+
+COMMON_TZ = [
+    "UTC",
+    "US/Eastern",
+    "US/Central",
+    "US/Mountain",
+    "US/Pacific",
+    "Europe/London",
+    "Europe/Berlin",
+    "Asia/Tokyo",
+    "Australia/Sydney"
+]
+# default to Eastern
+default_tz = "US/Eastern"
+# put user's tz selection into a variable used app-wide
+selected_tz = st.sidebar.selectbox("Display timezone for charts & labels", COMMON_TZ, index=COMMON_TZ.index(default_tz))
+st.sidebar.caption(f"Selected timezone: {selected_tz}")
+
+
 st.sidebar.markdown("---")
 if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", width=100)
@@ -537,10 +610,10 @@ lgbm_forecast = filter_by_time(lgbm_forecast_raw)
 cat_forecast = filter_by_time(cat_forecast_raw)
 
 # Convert all forecast times to viewer's local timezone for display and charting
-prophet_forecast = convert_to_local_time(prophet_forecast) if prophet_forecast is not None else prophet_forecast
-xgb_forecast = convert_to_local_time(xgb_forecast) if xgb_forecast is not None else xgb_forecast
-lgbm_forecast = convert_to_local_time(lgbm_forecast) if lgbm_forecast is not None else lgbm_forecast
-cat_forecast = convert_to_local_time(cat_forecast) if cat_forecast is not None else cat_forecast
+rophet_forecast = convert_to_local_time(prophet_forecast, time_col='ds', tz_str=selected_tz) if prophet_forecast is not None else prophet_forecast
+xgb_forecast = convert_to_local_time(xgb_forecast, time_col='ds', tz_str=selected_tz) if xgb_forecast is not None else xgb_forecast
+lgbm_forecast = convert_to_local_time(lgbm_forecast, time_col='ds', tz_str=selected_tz) if lgbm_forecast is not None else lgbm_forecast
+cat_forecast = convert_to_local_time(cat_forecast, time_col='ds', tz_str=selected_tz) if cat_forecast is not None else cat_forecast
 
 # But keep copies of UTC forecasts for consensus logic (use UTC internally)
 prophet_utc = filter_by_time(prophet_forecast_raw)
@@ -567,7 +640,7 @@ if all_big_restocks:
     consensus_df = pd.DataFrame(all_big_restocks).sort_values('ds').reset_index(drop=True)
     # Round to nearest 3 hours originally; with 15-min precision we group to nearest 15 min *or* keep as-is.
     # We'll round to nearest 15 minutes to group model agreement windows
-    consensus_df['time_group'] = consensus_df['ds'].dt.round('3H')
+    consensus_df['time_group'] = consensus_df['ds'].dt.round('15T')
     consensus_summary = consensus_df.groupby('time_group').agg(
         models=('model', lambda x: ', '.join(sorted(x.unique()))),
         model_count=('model', 'nunique'),
@@ -581,7 +654,8 @@ if all_big_restocks:
         return "Low"
     consensus_summary['Confidence'] = consensus_summary['model_count'].apply(get_confidence)
     # For display, convert the UTC time_group to local tz
-    consensus_summary['time_group'] = convert_to_local_time(consensus_summary.rename(columns={'time_group': 'ds'}), time_col='ds')['ds'].dt.tz_convert(tzlocal.get_localzone() if tzlocal else EASTERN)
+    consensus_local = convert_to_local_time(consensus_summary.rename(columns={'time_group': 'ds'}), time_col='ds', tz_str=selected_tz)
+    consensus_summary['time_group'] = consensus_local['ds']
     consensus_summary = consensus_summary.sort_values('time_group', ascending=True)
 else:
     consensus_summary = pd.DataFrame()
@@ -597,12 +671,12 @@ if not consensus_summary.empty and "High" in consensus_summary['Confidence'].val
     # Countdown: target_time is already localized
     target_time = top_pred['time_group']
     if target_time.tzinfo is None:
-        # assume local tz
         try:
-            local_tz = tzlocal.get_localzone() if tzlocal is not None else EASTERN
+            # assume selected timezone if not already localized
+            target_time = pytz.timezone(selected_tz).localize(target_time)
         except Exception:
-            local_tz = EASTERN
-        target_time = pytz.timezone(str(local_tz)).localize(target_time)
+            # fallback to Eastern if selected_tz is invalid
+            target_time = pytz.timezone("US/Eastern").localize(target_time)
     target_timestamp_ms = int(target_time.timestamp() * 1000)
 
     js_countdown = f"""<h2 id="countdown" style="text-align: left; font-weight: bold; color: #28a745;"></h2><script>var targetTime = {target_timestamp_ms}; function updateCountdown() {{ var now = new Date().getTime(); var diff = targetTime - now; if (diff <= 0) {{ document.getElementById("countdown").innerHTML = "Event in Progress"; clearInterval(interval); return; }} var d = Math.floor(diff / (1000 * 60 * 60 * 24)); var h = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60)); var m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60)); var s = Math.floor((diff % (1000 * 60)) / 1000); document.getElementById("countdown").innerHTML = d + "d " + h + "h " + m + "m " + s + "s"; }} var interval = setInterval(updateCountdown, 1000); updateCountdown(); </script>"""
@@ -641,7 +715,7 @@ with tabs[1]:
     fig_2_week = go.Figure()
     fig_2_week.add_trace(go.Scatter(x=history_in_window['DateTime'], y=history_in_window['Count'], mode='lines', name='Actual Past Activity', line=dict(color='blue', width=2)))
     fig_2_week.add_trace(go.Scatter(x=forecast_in_window['ds'], y=forecast_in_window['yhat'], mode='lines', name='Forecast', line=dict(color=chart_color, width=3, dash='dot')))
-    now_local_for_plot = datetime.now(pytz.UTC).astimezone(tzlocal.get_localzone() if tzlocal else EASTERN)
+    now_local_for_plot = datetime.now(pytz.UTC).astimezone(pytz.timezone(selected_tz))
     fig_2_week.add_shape(type="line", x0=now_local_for_plot, x1=now_local_for_plot, y0=0, y1=1, yref="paper", line=dict(color="red", width=3, dash="dash"))
     fig_2_week.add_annotation(x=now_local_for_plot, y=1.05, yref="paper", text="Current Time", showarrow=False)
     fig_2_week.update_layout(title=f"Past Week vs. Next Week Forecast for {retailer}", xaxis_title="Date", yaxis_title="Restock Activity", template="plotly_white", height=500)
