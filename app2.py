@@ -678,6 +678,9 @@ if os.path.exists("logo.png"):
 st.sidebar.warning("This data is the property of RestockR Monitors. Unauthorized sharing, distribution, or external use of this information may result in penalties or legal action.")
 st.sidebar.markdown("---")
 st.sidebar.markdown("Developed by **Captain400x**")
+st.sidebar.markdown("Code review by **Caleb Fleming**")
+
+
 
 retailer_df = full_df[full_df["Retailer"] == retailer].copy()
 
