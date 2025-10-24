@@ -628,21 +628,110 @@ default_index = 0
 if 'Target' in retailers:
     default_index = retailers.index('Target')
 retailer = st.sidebar.selectbox("Choose a retailer to forecast", retailers, index=default_index, label_visibility="collapsed")
-
+retailer_history_df = full_df[full_df['Retailer'] == retailer]
 forecast_horizon = st.sidebar.slider("Forecast Horizon (days)", 1, 30, 14, 1)
 forecast_hours = forecast_horizon * 24
 
+# -------------------------
+# 🧭 Data Summary + Countdown Section
+# -------------------------
 st.sidebar.markdown("---")
-st.sidebar.subheader("Data Summary")
-st.sidebar.markdown("**Next High-Confidence Alert:**")
-countdown_placeholder = st.sidebar.empty()
-retailer_history_df = full_df[full_df['Retailer'] == retailer]
+st.sidebar.subheader("📊 Data Summary")
+
+# Basic dataset info
 if retailer_history_df.empty:
     st.sidebar.info("Selected retailer has no data.")
-min_date = retailer_history_df['DateTime'].min().strftime('%b %d, %Y') if not retailer_history_df.empty else "N/A"
-max_date = retailer_history_df['DateTime'].max().strftime('%b %d, %Y') if not retailer_history_df.empty else "N/A"
-event_count = int(retailer_history_df['Count'].sum()) if not retailer_history_df.empty else 0
-st.sidebar.markdown(f"""<div style="font-size: 0.9em;">Data Available From: <strong style="font-size: 1.1em;">{min_date}</strong><br>Data Available To: <strong style="font-size: 1.1em;">{max_date}</strong><br>Total Recorded Events: <strong style="font-size: 1.1em;">{event_count:,}</strong></div>""", unsafe_allow_html=True)
+else:
+    min_date = retailer_history_df['DateTime'].min().strftime('%b %d, %Y')
+    max_date = retailer_history_df['DateTime'].max().strftime('%b %d, %Y')
+    event_count = int(retailer_history_df['Count'].sum())
+    st.sidebar.markdown(
+        f"""
+        <div style="font-size: 0.9em;">
+            Data Available From: <strong>{min_date}</strong><br>
+            Data Available To: <strong>{max_date}</strong><br>
+            Total Recorded Events: <strong>{event_count:,}</strong>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+   
+
+
+# Legend / key
+st.sidebar.markdown(
+    """
+    <div style="font-size: 0.85em; line-height: 1.4;">
+        <span style="color:#28a745; font-weight:bold;">🟢 High Confidence</span>: Strong model agreement<br>
+        <span style="color:#FFA500; font-weight:bold;">🟠 Medium Confidence</span>: Moderate agreement<br>
+        <span style="color:#FF4B4B; font-weight:bold;">🔴 Low Confidence</span>: Weak or single-model signal
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Add spacing / separator before countdowns
+st.sidebar.markdown("<hr style='border:1px solid #333;margin:10px 0;'>", unsafe_allow_html=True)
+st.sidebar.markdown("<div style='font-size:0.95em; font-weight:600; color:#ccc;'>⏳ Upcoming Restocks</div>", unsafe_allow_html=True)
+
+# Countdown placeholders (embedded under Data Summary)
+countdown_high = st.sidebar.empty()
+countdown_medium = st.sidebar.empty()
+countdown_low = st.sidebar.empty()
+
+def render_countdown_block(confidence_label, color, placeholder):
+    """Compact, balanced countdown block with smaller labels and larger numbers."""
+    if consensus_summary.empty or confidence_label not in consensus_summary['Confidence'].values:
+        placeholder.markdown(
+            f"<div style='color:{color}; font-size:0.85em; margin-top:2px;'>No {confidence_label}-confidence restock scheduled.</div>",
+            unsafe_allow_html=True
+        )
+        return
+
+    next_event = consensus_summary[consensus_summary['Confidence'] == confidence_label].iloc[0]
+    target_time = next_event['time_group']
+    if target_time.tzinfo is None:
+        target_time = pytz.timezone(selected_tz).localize(target_time)
+    target_timestamp_ms = int(target_time.timestamp() * 1000)
+
+    js = f"""
+    <div style='margin-top:4px; margin-bottom:2px;'>
+        <div style='color:{color}; font-weight:600; font-size:0.8em; margin-bottom:2px;'>
+            Next {confidence_label} Confidence Restock:
+        </div>
+        <div id="countdown_{confidence_label}" 
+             style="color:{color}; font-size:1.3em; font-weight:800; margin-left:2px; line-height:1.1;"></div>
+    </div>
+    <script>
+    var targetTime_{confidence_label} = {target_timestamp_ms};
+    function updateCountdown_{confidence_label}() {{
+        var now = new Date().getTime();
+        var diff = targetTime_{confidence_label} - now;
+        if (diff <= 0) {{
+            document.getElementById("countdown_{confidence_label}").innerHTML = "Now!";
+            clearInterval(interval_{confidence_label});
+            return;
+        }}
+        var d = Math.floor(diff / (1000*60*60*24));
+        var h = Math.floor((diff % (1000*60*60*24)) / (1000*60*60));
+        var m = Math.floor((diff % (1000*60*60)) / (1000*60));
+        var s = Math.floor((diff % (1000*60)) / 1000);
+        document.getElementById("countdown_{confidence_label}").innerHTML =
+            d + "d " + h + "h " + m + "m " + s + "s";
+    }}
+    var interval_{confidence_label} = setInterval(updateCountdown_{confidence_label}, 1000);
+    updateCountdown_{confidence_label}();
+    </script>
+    """
+    with placeholder.container():
+        components.html(js, height=50)
+
+
+
+
+
+
+
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Chart Customization")
@@ -678,30 +767,125 @@ if os.path.exists("logo.png"):
 st.sidebar.warning("This data is the property of RestockR Monitors. Unauthorized sharing, distribution, or external use of this information may result in penalties or legal action.")
 st.sidebar.markdown("---")
 st.sidebar.markdown("Developed by **Captain400x**")
-st.sidebar.markdown("Code review by **Caleb Fleming**")
-
-
 
 retailer_df = full_df[full_df["Retailer"] == retailer].copy()
 
 # --- Run All Models & Generate Consensus ---
-with st.spinner("Training models with advanced features... this may take a moment."):
-    prophet_model, prophet_forecast_raw = train_prophet_model(retailer_df, forecast_horizon)
-    xgb_model, xgb_forecast_raw = train_ml_model(retailer_df, forecast_horizon, model_type='xgb')
-    lgbm_model, lgbm_forecast_raw = train_ml_model(retailer_df, forecast_horizon, model_type='lgbm')
-    cat_model, cat_forecast_raw = train_ml_model(retailer_df, forecast_horizon, model_type='catboost')
+import pickle
+import lightgbm as lgb
+import xgboost as xgb
+import catboost as cb
+
+@st.cache_resource
+def load_pretrained_models(retailer):
+    try:
+        prophet_model = pickle.load(open(f"models/prophet_{retailer}.pkl", "rb"))
+        lgbm_model = lgb.Booster(model_file=f"models/lgbm_{retailer}.txt")
+        xgb_model = xgb.Booster(model_file=f"models/xgb_{retailer}.json")
+        cat_model = cb.CatBoostRegressor()
+        cat_model.load_model(f"models/cat_{retailer}.cbm")
+        return prophet_model, lgbm_model, xgb_model, cat_model
+    except Exception as e:
+        st.error(f"Error loading pre-trained models for {retailer}: {e}")
+        st.stop()
+
+with st.spinner("Loading pre-trained models..."):
+    prophet_model, lgbm_model, xgb_model, cat_model = load_pretrained_models(retailer)
+
+    # -------------------------------------
+    # 🔮 Generate Predictions Using Pre-Trained Models
+    # -------------------------------------
+    periods = forecast_horizon * 24 * 4  # 15-min intervals
+
+    # Prophet Prediction
+    future = prophet_model.make_future_dataframe(periods=periods, freq="15T")
+    prophet_forecast_raw = prophet_model.predict(future)
+    prophet_forecast_raw['ds'] = pd.to_datetime(prophet_forecast_raw['ds']).dt.tz_localize(pytz.UTC)
+    prophet_forecast_raw['yhat'] = prophet_forecast_raw['yhat'].clip(lower=0)
+    prophet_forecast_raw['Weekday'] = prophet_forecast_raw['ds'].dt.day_name()
+
+    # -------------------------------------
+    # ⚙️ Prepare Features for ML Models
+    # -------------------------------------
+    retailer_featured = create_features_for_ml(retailer_df)
+    last_date = retailer_featured['DateTime'].max()
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(minutes=15), periods=periods, freq='15T')
+
+    # Build future feature set
+    future_df = pd.DataFrame({'DateTime': future_dates})
+    full_history = pd.concat([retailer_featured, future_df], ignore_index=True)
+    full_history = create_features_for_ml(full_history)
+
+    FEATURES = [
+        'hour', 'quarter', 'dayofweek', 'dayofyear', 'weekofyear', 'month',
+        'tod_sin', 'tod_cos', 'dayofweek_sin', 'dayofweek_cos',
+        'is_weekend', 'is_business_hours', 'lag_15m', 'lag_1h', 'lag_1d', 'lag_1w'
+    ]
+    X_future = full_history.iloc[-len(future_df):][FEATURES]
+
+    # -------------------------------------
+    # ⚡ Predict with LightGBM, XGBoost, CatBoost
+    # -------------------------------------
+
+    # LightGBM
+    try:
+        lgbm_yhat = np.clip(lgbm_model.predict(X_future), 0, None)
+    except Exception:
+        lgbm_yhat = np.clip(lgbm_model.predict(X_future.values), 0, None)
+
+    # XGBoost
+    dtest = xgb.DMatrix(X_future)
+    xgb_yhat = np.clip(xgb_model.predict(dtest), 0, None)
+
+    # CatBoost
+    cat_yhat = np.clip(cat_model.predict(X_future), 0, None)
+
+    # Helper function to create forecast DataFrame
+    def make_forecast_df(future_dates, yhat):
+        df = pd.DataFrame({'ds': future_dates, 'yhat': yhat})
+        df['ds'] = pd.to_datetime(df['ds']).dt.tz_localize(pytz.UTC)
+        df['Weekday'] = df['ds'].dt.day_name()
+        return df
+
+    lgbm_forecast_raw = make_forecast_df(future_dates, lgbm_yhat)
+    xgb_forecast_raw = make_forecast_df(future_dates, xgb_yhat)
+    cat_forecast_raw = make_forecast_df(future_dates, cat_yhat)
+
+
+
 
     FEATURES = ['hour', 'quarter', 'dayofweek', 'dayofyear', 'weekofyear', 'month',
                 'tod_sin', 'tod_cos', 'dayofweek_sin', 'dayofweek_cos',
                 'is_weekend', 'is_business_hours', 'lag_15m', 'lag_1h', 'lag_1d', 'lag_1w']
     try:
-        lgbm_imp = lgbm_model.feature_importances_
-        xgb_imp = xgb_model.feature_importances_
-        cat_imp = cat_model.feature_importances_
-        avg_imp = (lgbm_imp / lgbm_imp.sum() + xgb_imp / xgb_imp.sum() + cat_imp / cat_imp.sum()) / 3
-        importance_df = pd.DataFrame({'Feature': FEATURES, 'Importance': avg_imp}).sort_values('Importance', ascending=False)
+        # LightGBM importance (works for Booster)
+        lgbm_imp = lgbm_model.feature_importance()
+
+        # XGBoost importance
+        xgb_gain = xgb_model.get_score(importance_type='gain')
+        xgb_imp = np.array([xgb_gain.get(f, 0.0) for f in FEATURES])
+
+        # CatBoost importance
+        cat_imp = cat_model.get_feature_importance()
+
+        # Normalize and average all three
+        lgbm_imp = lgbm_imp / (lgbm_imp.sum() or 1)
+        xgb_imp = xgb_imp / (xgb_imp.sum() or 1)
+        cat_imp = cat_imp / (cat_imp.sum() or 1)
+        avg_imp = (lgbm_imp + xgb_imp + cat_imp) / 3
+
+        importance_df = pd.DataFrame({
+            'Feature': FEATURES,
+            'Importance': avg_imp
+        }).sort_values('Importance', ascending=False)
+
     except Exception:
-        importance_df = pd.DataFrame({'Feature': FEATURES, 'Importance': [1 / len(FEATURES)] * len(FEATURES)}).sort_values('Importance', ascending=False)
+        # fallback: equal weighting if any model doesn’t support importance lookup
+        importance_df = pd.DataFrame({
+            'Feature': FEATURES,
+            'Importance': [1 / len(FEATURES)] * len(FEATURES)
+        }).sort_values('Importance', ascending=False)
+
 
 # Filter only future predictions (in UTC) and convert to local for display
 prophet_forecast = filter_by_time(prophet_forecast_raw)
@@ -710,7 +894,7 @@ lgbm_forecast = filter_by_time(lgbm_forecast_raw)
 cat_forecast = filter_by_time(cat_forecast_raw)
 
 # Convert all forecast times to viewer's local timezone for display and charting
-rophet_forecast = convert_to_local_time(prophet_forecast, time_col='ds', tz_str=selected_tz) if prophet_forecast is not None else prophet_forecast
+prophet_forecast = convert_to_local_time(prophet_forecast, time_col='ds', tz_str=selected_tz)
 xgb_forecast = convert_to_local_time(xgb_forecast, time_col='ds', tz_str=selected_tz) if xgb_forecast is not None else xgb_forecast
 lgbm_forecast = convert_to_local_time(lgbm_forecast, time_col='ds', tz_str=selected_tz) if lgbm_forecast is not None else lgbm_forecast
 cat_forecast = convert_to_local_time(cat_forecast, time_col='ds', tz_str=selected_tz) if cat_forecast is not None else cat_forecast
@@ -740,7 +924,7 @@ if all_big_restocks:
     consensus_df = pd.DataFrame(all_big_restocks).sort_values('ds').reset_index(drop=True)
     # Round to nearest 3 hours originally; with 15-min precision we group to nearest 15 min *or* keep as-is.
     # We'll round to nearest 15 minutes to group model agreement windows
-    consensus_df['time_group'] = consensus_df['ds'].dt.round('1H')
+    consensus_df['time_group'] = consensus_df['ds'].dt.round('15T')
     consensus_summary = consensus_df.groupby('time_group').agg(
         models=('model', lambda x: ', '.join(sorted(x.unique()))),
         model_count=('model', 'nunique'),
@@ -759,32 +943,18 @@ if all_big_restocks:
     consensus_summary = consensus_summary.sort_values('time_group', ascending=True)
 else:
     consensus_summary = pd.DataFrame()
+# --- Render Countdowns after consensus_summary exists ---
 
-# --- Top Prediction & Countdown ---
-st.markdown("---")
-st.subheader("🚀 Top Prediction")
-if not consensus_summary.empty and "High" in consensus_summary['Confidence'].values:
-    top_pred = consensus_summary[consensus_summary['Confidence'] == 'High'].iloc[0]
-    time_str = top_pred['time_group'].strftime('%A, %b %d at %I:%M %p')
-    st.success(f"**Next High-Confidence Restock Window:** Around **{time_str}**\n- **Models in Agreement:** {top_pred['models']}\n- **Average Predicted Activity:** {top_pred['avg_activity']:.1f}")
 
-    # Countdown: target_time is already localized
-    target_time = top_pred['time_group']
-    if target_time.tzinfo is None:
-        try:
-            # assume selected timezone if not already localized
-            target_time = pytz.timezone(selected_tz).localize(target_time)
-        except Exception:
-            # fallback to Eastern if selected_tz is invalid
-            target_time = pytz.timezone("US/Eastern").localize(target_time)
-    target_timestamp_ms = int(target_time.timestamp() * 1000)
-
-    js_countdown = f"""<h2 id="countdown" style="text-align: left; font-weight: bold; color: #28a745;"></h2><script>var targetTime = {target_timestamp_ms}; function updateCountdown() {{ var now = new Date().getTime(); var diff = targetTime - now; if (diff <= 0) {{ document.getElementById("countdown").innerHTML = "Event in Progress"; clearInterval(interval); return; }} var d = Math.floor(diff / (1000 * 60 * 60 * 24)); var h = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60)); var m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60)); var s = Math.floor((diff % (1000 * 60)) / 1000); document.getElementById("countdown").innerHTML = d + "d " + h + "h " + m + "m " + s + "s"; }} var interval = setInterval(updateCountdown, 1000); updateCountdown(); </script>"""
-    with countdown_placeholder.container():
-        components.html(js_countdown, height=75)
+if consensus_summary.empty:
+    countdown_high.markdown("<span style='color:#999;'>No predictions available.</span>", unsafe_allow_html=True)
+    countdown_medium.empty()
+    countdown_low.empty()
 else:
-    st.info("No 'High Confidence' restocks...")
-    countdown_placeholder.info("No high-confidence alert scheduled.")
+    render_countdown_block("High", "#28a745", countdown_high)
+    render_countdown_block("Medium", "#FFA500", countdown_medium)
+    render_countdown_block("Low", "#FF4B4B", countdown_low)
+
 
 # -------------------------
 # 7. Main Tabs
@@ -826,5 +996,3 @@ with tabs[5]:
     st.header("🐾 CatBoost Model Details")
     fig_cat = create_forecast_chart(cat_forecast, cat_big, retailer, "CatBoost Forecast", chart_color)
     st.plotly_chart(fig_cat, use_container_width=True)
-
-
