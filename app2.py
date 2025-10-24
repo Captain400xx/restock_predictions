@@ -23,6 +23,25 @@ import numpy as np
 import os
 import streamlit.components.v1 as components
 
+import streamlit as st
+
+# --- Google Analytics Tracking ---
+GA_ID = "G-8QM2410BCR"
+
+GA_SCRIPT = f"""
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id={GA_ID}"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){{dataLayer.push(arguments);}}
+  gtag('js', new Date());
+  gtag('config', '{GA_ID}');
+</script>
+"""
+
+# Injects the Google Analytics tag into the app (acts like <head>)
+st.components.v1.html(GA_SCRIPT, height=0)
+
 
 # Ignore warnings
 warnings.filterwarnings("ignore")
@@ -804,4 +823,5 @@ with tabs[5]:
     st.header("🐾 CatBoost Model Details")
     fig_cat = create_forecast_chart(cat_forecast, cat_big, retailer, "CatBoost Forecast", chart_color)
     st.plotly_chart(fig_cat, use_container_width=True)
+
 
