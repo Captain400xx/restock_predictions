@@ -8,6 +8,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 from prophet import Prophet
 import cmdstanpy
 print("✅ Prophet backend:", cmdstanpy.__version__)
@@ -192,6 +193,28 @@ def convert_to_local_time(df, time_col='ds', tz_str='UTC'):
 
 # ----- MODEL TRAINING FUNCTIONS -----
 @st.cache_data
+# ----- MODEL TRAINING FUNCTIONS -----
+
+def get_big_restocks(forecast_df, threshold_factor=1.3):
+    """
+    Identifies predicted 'big restocks' — points where activity sharply exceeds the trend.
+    Returns:
+        forecast_df (unchanged)
+        big_restocks_df (subset DataFrame of spikes)
+    """
+    if forecast_df is None or forecast_df.empty:
+        return forecast_df, pd.DataFrame()
+
+    df = forecast_df.copy()
+    yhat_mean = df['yhat'].mean()
+    yhat_std = df['yhat'].std()
+
+    # Define threshold for spikes
+    threshold = yhat_mean + threshold_factor * yhat_std
+    big_restocks = df[df['yhat'] > threshold]
+
+    return df, big_restocks
+
 def train_prophet_model(data, forecast_horizon):
     # data: DataFrame for single retailer with DateTime and Count at 15-min intervals
     df_prophet = data.rename(columns={"DateTime": "ds", "Count": "y"})[['ds', 'y']].copy()
@@ -219,14 +242,14 @@ def train_prophet_model(data, forecast_horizon):
         weekly_seasonality=True,
         daily_seasonality=True,
         holidays=holidays,
-        changepoint_prior_scale=0.15,     # allows moderate flexibility
-        seasonality_prior_scale=10.0,     # stronger cycles
-        interval_width=0.9
+        changepoint_prior_scale=0.4,     # allows moderate flexibility
+        seasonality_prior_scale=15.0,     # stronger cycles
+        interval_width=0.95
     )
 
     # Step 4: Add finer seasonality cycles
-    model.add_seasonality(name='hourly', period=1, fourier_order=10)
-    model.add_seasonality(name='3hourly', period=3, fourier_order=8)
+    model.add_seasonality(name='hourly', period=1, fourier_order=20)
+    model.add_seasonality(name='3hourly', period=3, fourier_order=10)
 
 
 
@@ -302,20 +325,22 @@ def train_ml_model(data, forecast_horizon, model_type='lgbm'):
     return model, forecast_df
 
 # ----- ANALYSIS & PLOTTING -----
-def get_big_restocks(forecast_df):
-    if forecast_df is None or forecast_df.empty:
-        return 0.0, pd.DataFrame()
-    forecast_df = forecast_df.copy()
-    forecast_df['yhat'] = forecast_df.get('yhat', forecast_df.get('yhat', 0)).clip(lower=0)
-    cutoff = forecast_df["yhat"].quantile(0.90) if "yhat" in forecast_df.columns else 0.0
-    cutoff = max(cutoff, 0.5)
-    big = forecast_df[forecast_df["yhat"] >= cutoff].copy()
-    return cutoff, big.sort_values("ds")
-
 def create_forecast_chart(forecast_df, big_restocks_df, retailer, title, color):
     fig = go.Figure()
     if forecast_df is None or forecast_df.empty:
         fig.update_layout(title=f"No forecast available for {retailer}")
+        # Limit x-axis to 7 days from current time
+        now_local = datetime.now(pytz.UTC).astimezone(pytz.timezone(selected_tz))
+        x_end = now_local + timedelta(days=7)
+        fig.update_xaxes(range=[now_local, x_end])
+
+        # Automatically zoom around predicted spikes
+        if not forecast_df.empty:
+            active = forecast_df[forecast_df['yhat'] > forecast_df['yhat'].mean() * 1.2]
+            if not active.empty:
+                x_min = active['ds'].min() - pd.Timedelta(hours=12)
+                x_max = active['ds'].max() + pd.Timedelta(hours=12)
+                fig.update_xaxes(range=[x_min, x_max])
         return fig
 
     # Ensure ds is tz-aware for display
@@ -325,21 +350,41 @@ def create_forecast_chart(forecast_df, big_restocks_df, retailer, title, color):
     
     display_times = f['ds'].dt.tz_convert(pytz.timezone(selected_tz))
 
+    # --- Handle extreme spikes so they don't distort the chart ---
+    if not f.empty:
+        cap_value = f['yhat'].quantile(0.99)  # cap at 99th percentile
+        f['yhat_clipped'] = np.clip(f['yhat'], 0, cap_value)
+    else:
+        f['yhat_clipped'] = f.get('yhat', [])
 
-    fig.add_trace(go.Scatter(x=display_times, y=f["yhat"], mode="lines", name="Forecast",
-                             line=dict(width=2, color=color),
-                             hovertemplate='%{x|%Y-%m-%d %H:%M} — %{y:.1f} activity<extra></extra>'))
+    # --- Plot forecast line using clipped values ---
+    fig.add_trace(go.Scatter(
+        x=display_times,
+        y=f["yhat_clipped"],
+        mode="lines",
+        name="Forecast",
+        line=dict(width=2, color=color),
+        hovertemplate='%{x|%Y-%m-%d %H:%M} — %{y:.1f} activity<extra></extra>'
+    ))
+
+    # --- Plot predicted big restocks ---
     if big_restocks_df is not None and not big_restocks_df.empty:
         big = big_restocks_df.copy()
         if big['ds'].dt.tz is None:
             big['ds'] = big['ds'].dt.tz_localize(pytz.UTC)
         big_display = big['ds'].dt.tz_convert(pytz.timezone(selected_tz))
-        fig.add_trace(go.Scatter(x=big_display, y=big['yhat'], mode="markers", name="Predicted Big Restock",
-                                 marker=dict(size=10, color='red', symbol='star'),
-                                 hovertemplate='%{x|%Y-%m-%d %H:%M} — %{y:.1f} activity<extra></extra>'))
+        fig.add_trace(go.Scatter(
+            x=big_display,
+            y=big['yhat'],
+            mode="markers",
+            name="Predicted Big Restock",
+            marker=dict(size=10, color='red', symbol='star'),
+            hovertemplate='%{x|%Y-%m-%d %H:%M} — %{y:.1f} activity<extra></extra>'
+        ))
 
+    # --- Layout and time marker ---
     now_local = datetime.now(pytz.UTC).astimezone(pytz.timezone(selected_tz))
-    ymax = max(f['yhat'].max() * 1.2, 5) if not f.empty else 5
+    ymax = f['yhat_clipped'].max() * 1.1 if not f.empty else 5
     fig.update_layout(
         title=f"{title} for {retailer}",
         hovermode="x unified",
@@ -347,10 +392,21 @@ def create_forecast_chart(forecast_df, big_restocks_df, retailer, title, color):
         height=500,
         yaxis=dict(title="Predicted Restock Activity", range=[0, ymax]),
         xaxis=dict(title=f"Date (Local: {selected_tz})", showgrid=True),
-        shapes=[dict(type='line', x0=now_local, y0=0, x1=now_local, y1=1, yref='paper', line=dict(color='RoyalBlue', width=2, dash='dash'))],
-        annotations=[dict(x=now_local, y=1.05, yref='paper', text='Current Time', showarrow=False)]
+        shapes=[
+            dict(
+                type='line',
+                x0=now_local, y0=0, x1=now_local, y1=1,
+                yref='paper',
+                line=dict(color='RoyalBlue', width=2, dash='dash')
+            )
+        ],
+        annotations=[
+            dict(x=now_local, y=1.05, yref='paper', text='Current Time', showarrow=False)
+        ]
     )
+
     return fig
+
 
 def display_consensus_schedule(df):
     st.markdown("""<style>.schedule-table { width: 100%; border-collapse: collapse; font-size: 0.9em; } .schedule-table th, .schedule-table td { padding: 8px; text-align: left; border-bottom: 1px solid #444; } .schedule-table th { background-color: #1a1a1a; } .high-confidence { background-color: rgba(40, 167, 69, 0.3); } .medium-confidence { background-color: rgba(255, 193, 7, 0.3); } .low-confidence { background-color: rgba(220, 53, 69, 0.3); } .day-group { font-weight: bold; font-size: 1.1em; padding-top: 15px; }</style>""", unsafe_allow_html=True)
@@ -415,61 +471,74 @@ def create_importance_chart(df):
     fig.update_layout(title="Model Feature Importance (All Models)", xaxis_title="Average Importance", yaxis_title="Feature", template="plotly_white", yaxis=dict(autorange="reversed"), height=400)
     return fig
 
-def create_calendar_heatmap(forecast_df, retailer):
-    if forecast_df is None or forecast_df.empty:
-        return go.Figure().update_layout(title="No data")
-    df = forecast_df.copy()
-    # convert to local for nicer date labels
-    try:
-        display_times = df['ds'].dt.tz_convert(pytz.timezone(selected_tz))
-    except Exception:
-        pass
-
-    if df['ds'].dt.tz is None:
-        df['ds'] = df['ds'].dt.tz_localize(pytz.UTC)
-    df['local_ds'] = df['ds'].dt.tz_convert(pytz.timezone(selected_tz))
-    df['date'] = df['local_ds'].dt.date
-    daily_max = df.groupby('date')['yhat'].max().reset_index()
-    daily_max['day_of_week'] = pd.to_datetime(daily_max['date']).dt.dayofweek
-    daily_max['week_of_year'] = pd.to_datetime(daily_max['date']).dt.isocalendar().week
-    daily_max['day_str'] = pd.to_datetime(daily_max['date']).dt.strftime('%a<br>%d')
-    weeks = sorted(daily_max['week_of_year'].unique())
-    heatmap_data = np.full((7, len(weeks)), np.nan)
-    text_data = np.full((7, len(weeks)), '', dtype=object)
-    for _, row in daily_max.iterrows():
-        try:
-            week_idx = weeks.index(row['week_of_year'])
-            day_idx = row['day_of_week']
-            heatmap_data[day_idx, week_idx] = row['yhat']
-            text_data[day_idx, week_idx] = row['day_str']
-        except (IndexError, ValueError):
-            continue
-    fig = go.Figure(data=go.Heatmap(z=heatmap_data, x=[f"Week {w}" for w in weeks], y=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], hoverongaps=False, text=text_data, texttemplate="%{text}", colorscale='Oranges', colorbar_title='Max Activity'))
-    fig.update_layout(title=f"Daily Activity Heatmap for {retailer}", xaxis_title="Week of the Year", height=400)
-    return fig
 
 def create_hourly_heatmap(forecast_df, retailer):
-    if forecast_df is None or forecast_df.empty:
-        return go.Figure().update_layout(title="No data")
-    df = forecast_df.copy()
-    # convert to local for consistent hour labels
-    try:
-        display_times = df['ds'].dt.tz_convert(pytz.timezone(selected_tz))
-    except Exception:
-        pass
+    import plotly.graph_objects as go
+    import pandas as pd
 
-    if df['ds'].dt.tz is None:
-        df['ds'] = df['ds'].dt.tz_localize(pytz.UTC)
-    df['local_ds'] = df['ds'].dt.tz_convert(pytz.timezone(selected_tz))
-    df['hour'] = df['local_ds'].dt.hour
-    df['dayofweek'] = df['local_ds'].dt.dayofweek
-    hourly_avg = df.groupby(['dayofweek', 'hour'])['yhat'].mean().reset_index()
-    heatmap_data = hourly_avg.pivot(index='dayofweek', columns='hour', values='yhat').reindex(index=range(7), columns=range(24))
-    day_labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-    hour_labels = [f"{h}:00" for h in range(24)]
-    fig = go.Figure(data=go.Heatmap(z=heatmap_data.values, x=hour_labels, y=day_labels, colorscale='Oranges', colorbar_title='Avg. Activity'))
-    fig.update_layout(title=f"Hourly Activity Heatmap for {retailer}", xaxis_title="Hour of Day (Local)", yaxis_title="Day of Week", height=500)
+    if forecast_df is None or forecast_df.empty:
+        return go.Figure()
+
+    forecast_df['local_time'] = pd.to_datetime(forecast_df['ds'])
+    forecast_df['hour'] = forecast_df['local_time'].dt.hour
+    forecast_df['day'] = forecast_df['local_time'].dt.day_name().str[:3]
+
+    # Aggregate mean restock activity
+    heatmap_data = forecast_df.groupby(['day', 'hour'])['yhat'].mean().unstack(fill_value=0)
+    heatmap_data = heatmap_data.reindex(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
+
+    # Fix color scale (smooth gradient from low -> high)
+    color_scale = [
+        [0.0, "#e0e1dd"],  # deep navy (low)
+        [0.5, "#415a77"],  # mid tone
+        [1.0, "#0d1b2a"]   # soft white (high)
+    ]
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=heatmap_data.values,
+            x=[f"{h%12 or 12}{'a' if h<12 else 'p'}" for h in heatmap_data.columns],
+            y=heatmap_data.index,
+            colorscale=color_scale,
+            zmin=heatmap_data.values.min(),
+            zmax=heatmap_data.values.max(),
+            colorbar=dict(
+                title=dict(
+                    text="Restock Intensity",
+                    font=dict(size=12, color="white")
+                ),
+                tickvals=[
+                    heatmap_data.values.min(),
+                    (heatmap_data.values.min() + heatmap_data.values.max()) / 2,
+                    heatmap_data.values.max()
+                ],
+                ticktext=["Low", "Medium", "High"],
+                tickfont=dict(color="white"),
+            ),
+            hoverongaps=False,
+        )
+    )
+
+    fig.update_layout(
+        title=f"🕒 Hourly Restock Activity Pattern for {retailer}",
+        xaxis=dict(
+            tickfont=dict(color="white"),
+            title=dict(text="Hour of Day", font=dict(color="white"))
+        ),
+        yaxis=dict(
+            tickfont=dict(color="white"),
+            title=dict(text="Day of Week", font=dict(color="white"))
+        ),
+        title_font=dict(size=18, color="white"),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=60, r=40, t=80, b=50)
+    )
+
     return fig
+
+
+
 
 # -------------------------
 # 5. Main App Logic
@@ -499,22 +568,31 @@ full_df = process_data_for_forecasting(raw_data_string)
 
 with st.expander("👋 How to Use This App", expanded=True):
     st.markdown("""
-    This app forecasts Pokémon card restock activity using multiple models.
-    - **Select a Retailer:** Use the dropdown in the sidebar.
-    - **Set the Forecast Horizon:** Use the slider to decide how far into the future to predict. Up to 30 days
-     - **Explore the Tabs:**
-        - **⭐ Prediction Schedule:** A visual schedule of high-confidence predictions.
-        - **📅 2-Week View:** A chart to check model accuracy against the past week's data.
-        - **📊 Analysis:** Heatmaps showing the hottest days and times for restocks.
-        - **Model Tabs (Prophet, etc.):** Dive deep into the forecast of each individual model.
+    This application analyzes historical Pokémon card restock data and uses multiple machine learning models to forecast future restock activity.
 
+    ### 🧭 Getting Started
+    - **Select a Retailer:** Choose from the sidebar dropdown.  
+    - **Set Forecast Horizon:** Adjust the slider to define how far ahead to predict (up to 30 days).  
+    - **Explore the Tabs:**  
+        - ⭐ **Prediction Schedule:** Displays upcoming high-confidence restock windows.  
+        - 📊 **Analysis:** Shows heatmaps highlighting the most active days and hours.  
+        - 🔮 **Model Tabs:** View detailed forecasts from each individual model.  
 
-         **What is 'Predicted Restock Activity'?** Since we are counting every restock event as '1', the model forecasts the **frequency of restock events per hour**.
-         - A **low** score (e.g., 0-1) means no or very few restock events are expected.
-         - A **high** score (e.g., 5+) means the model predicts a cluster of many separate restock events in that hour.
+    ### 📈 Understanding Predictions
+    Each restock event is counted as **1**, so model outputs represent the **expected frequency of restocks per 15-minute interval**.  
+    - **Low values (0–1):** Minimal or no restock activity expected.  
+    - **High values (5+):** Indicates multiple restocks likely during that time period.  
 
-    Note: Predictions are now at 15-minute precision. Models are time-weighted to emphasize recent data.
+    ### 🤖 Model Overview
+    - **Prophet:** Detects consistent time-based patterns — ideal for recurring events such as nightly or weekly restock cycles. It captures trends like Target’s regular restocks but may smooth out sudden spikes.  
+    - **LightGBM:** Reacts quickly to recent restock changes and short-term bursts of activity. Best for spotting sudden shifts in timing, like when a retailer starts restocking earlier than usual.  
+    - **XGBoost:** Balances long-term and short-term trends, handling irregular restock patterns across days or weeks. Produces stable, moderate predictions with fewer false alerts.  
+    - **CatBoost:** Learns subtle timing differences between retailers and detects patterns hidden within categorical data. Great at recognizing nuanced behaviors, such as retailer-specific restock quirks.  
+
+    *All models are time-weighted to emphasize recent data and improve short-term accuracy.*
     """)
+
+
 
 # -------------------------
 # 6. Sidebar Controls
@@ -640,7 +718,7 @@ if all_big_restocks:
     consensus_df = pd.DataFrame(all_big_restocks).sort_values('ds').reset_index(drop=True)
     # Round to nearest 3 hours originally; with 15-min precision we group to nearest 15 min *or* keep as-is.
     # We'll round to nearest 15 minutes to group model agreement windows
-    consensus_df['time_group'] = consensus_df['ds'].dt.round('15T')
+    consensus_df['time_group'] = consensus_df['ds'].dt.round('1H')
     consensus_summary = consensus_df.groupby('time_group').agg(
         models=('model', lambda x: ', '.join(sorted(x.unique()))),
         model_count=('model', 'nunique'),
@@ -689,7 +767,7 @@ else:
 # -------------------------
 # 7. Main Tabs
 # -------------------------
-tab_names = ["⭐ Prediction Schedule", "📅 2-Week View", "📊 Analysis", "🔮 Prophet", "🚀 LightGBM", "🌟 XGBoost", "🐾 CatBoost"]
+tab_names = ["⭐ Prediction Schedule", "📊 Analysis", "🔮 Prophet", "🚀 LightGBM", "🌟 XGBoost", "🐾 CatBoost"]
 tabs = st.tabs(tab_names)
 
 with tabs[0]:
@@ -698,36 +776,10 @@ with tabs[0]:
     st.plotly_chart(consensus_fig, use_container_width=True)
     display_consensus_schedule(consensus_summary)
 
-with tabs[1]:
-    st.header("2-Week Accuracy Check (Past vs. Future)")
-    st.markdown("This chart shows how well the **Prophet model's forecast (line)** matched the **actual historical data (line)** for the past 7 days.")
-    now = datetime.now(pytz.UTC)
-    start_date = now - timedelta(days=7)
-    end_date = now + timedelta(days=7)
-    # convert retailer history (which is in naive DateTime) to UTC-aware for comparison
-    history_in_window = retailer_history_df.copy()
-    history_in_window['DateTime'] = pd.to_datetime(history_in_window['DateTime'])
-    history_in_window = history_in_window[(history_in_window['DateTime'] >= (start_date.astimezone(pytz.UTC).replace(tzinfo=None))) & (history_in_window['DateTime'] <= (now.astimezone(pytz.UTC).replace(tzinfo=None)))]
-    prophet_full_forecast = filter_by_time(prophet_forecast_raw, future_only=False)
-    # convert prophet_full_forecast to local for plotting
-    prophet_full_local = convert_to_local_time(prophet_full_forecast) if prophet_full_forecast is not None else prophet_full_forecast
-    forecast_in_window = prophet_full_local[(prophet_full_local['ds'] >= start_date) & (prophet_full_local['ds'] <= end_date)]
-    fig_2_week = go.Figure()
-    fig_2_week.add_trace(go.Scatter(x=history_in_window['DateTime'], y=history_in_window['Count'], mode='lines', name='Actual Past Activity', line=dict(color='blue', width=2)))
-    fig_2_week.add_trace(go.Scatter(x=forecast_in_window['ds'], y=forecast_in_window['yhat'], mode='lines', name='Forecast', line=dict(color=chart_color, width=3, dash='dot')))
-    now_local_for_plot = datetime.now(pytz.UTC).astimezone(pytz.timezone(selected_tz))
-    fig_2_week.add_shape(type="line", x0=now_local_for_plot, x1=now_local_for_plot, y0=0, y1=1, yref="paper", line=dict(color="red", width=3, dash="dash"))
-    fig_2_week.add_annotation(x=now_local_for_plot, y=1.05, yref="paper", text="Current Time", showarrow=False)
-    fig_2_week.update_layout(title=f"Past Week vs. Next Week Forecast for {retailer}", xaxis_title="Date", yaxis_title="Restock Activity", template="plotly_white", height=500)
-    st.plotly_chart(fig_2_week, use_container_width=True)
 
-with tabs[2]:
+with tabs[1]:
     st.header("Analysis Heatmaps")
     st.markdown("These charts show the typical patterns of restock activity, based on model forecasts.")
-    st.subheader("Daily Activity Heatmap")
-    if prophet_forecast is not None and not prophet_forecast.empty:
-        calendar_fig = create_calendar_heatmap(prophet_forecast, retailer)
-        st.plotly_chart(calendar_fig, use_container_width=True)
     st.subheader("Hourly Activity Heatmap")
     if prophet_forecast is not None and not prophet_forecast.empty:
         hourly_fig = create_hourly_heatmap(prophet_forecast, retailer)
@@ -736,19 +788,19 @@ with tabs[2]:
     fig_imp = create_importance_chart(importance_df)
     st.plotly_chart(fig_imp, use_container_width=True)
 
-with tabs[3]:
+with tabs[2]:
     st.header("🔮 Prophet Model Details")
     fig_prophet = create_forecast_chart(prophet_forecast, prophet_big, retailer, "Prophet Forecast", chart_color)
     st.plotly_chart(fig_prophet, use_container_width=True)
-with tabs[4]:
+with tabs[3]:
     st.header("🚀 LightGBM Model Details")
     fig_lgbm = create_forecast_chart(lgbm_forecast, lgbm_big, retailer, "LightGBM Forecast", chart_color)
     st.plotly_chart(fig_lgbm, use_container_width=True)
-with tabs[5]:
+with tabs[4]:
     st.header("🌟 XGBoost Model Details")
     fig_xgb = create_forecast_chart(xgb_forecast, xgb_big, retailer, "XGBoost Forecast", chart_color)
     st.plotly_chart(fig_xgb, use_container_width=True)
-with tabs[6]:
+with tabs[5]:
     st.header("🐾 CatBoost Model Details")
     fig_cat = create_forecast_chart(cat_forecast, cat_big, retailer, "CatBoost Forecast", chart_color)
     st.plotly_chart(fig_cat, use_container_width=True)
