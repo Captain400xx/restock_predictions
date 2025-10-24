@@ -26,7 +26,7 @@
 git clone https://github.com/<your-username>/restock_forecast_app.git
 ```
 
-##Set Up Your Data
+## Set Up Your Data
 
 - Place your historical restock data in the same directory as the app:
 - File name: my_restock_data.csv
