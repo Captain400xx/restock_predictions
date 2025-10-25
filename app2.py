@@ -1,5 +1,5 @@
 # ----------------------------------------------------------------------
-# Pokémon Card Drop Forecast - v7.6 (15-min precision + time-weighting + local tz)
+# Pokémon Card Drop Forecast - # Pokémon Card Drop Forecast - v8.0 (no Prophet, lightweight version)
 # ----------------------------------------------------------------------
 
 # -------------------------
@@ -9,9 +9,6 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from prophet import Prophet
-import cmdstanpy
-print("✅ Prophet backend:", cmdstanpy.__version__)
 import lightgbm as lgb
 import xgboost as xgb
 import catboost as cb
@@ -22,6 +19,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import os
 import streamlit.components.v1 as components
+import gc
 
 import streamlit as st
 
@@ -158,8 +156,6 @@ def create_features_for_ml(df):
     # feature: minutes since last restock event
     df['minutes_since_last'] = df['DateTime'].diff().dt.total_seconds().div(60).fillna(0)
 
-
-
     # continuous time-of-day feature in minutes for smooth cyclical encodings
     df['minutes_of_day'] = df['hour'] * 60 + df['minute']
     df['tod_sin'] = np.sin(2 * np.pi * df['minutes_of_day'] / (24 * 60.0))
@@ -173,7 +169,6 @@ def create_features_for_ml(df):
     df['is_business_hours'] = ((df['hour'] >= 9) & (df['hour'] <= 17)).astype(int)
 
     # lag features for 15-min resolution:
-    # shift(1) => previous 15 min, shift(4) => previous 1 hour, shift(96) => previous 24 hours
     df['lag_15m'] = df['Count'].shift(1).fillna(0)
     df['lag_1h'] = df['Count'].shift(4).fillna(0)
     df['lag_1d'] = df['Count'].shift(96).fillna(0)
@@ -184,17 +179,42 @@ def create_features_for_ml(df):
     df['rolling_3h_mean'] = df['Count'].rolling(12, min_periods=1).mean()
     df['rolling_1d_mean'] = df['Count'].rolling(96, min_periods=1).mean()
 
-
     # fill any remaining NaNs
     df.fillna(0, inplace=True)
+
+    # ✅ Memory optimization — compress dtypes safely
+    for col in ['hour', 'quarter', 'dayofweek', 'dayofyear', 'weekofyear', 'month']:
+        if col in df.columns:
+            df[col] = df[col].astype('int8')
+
+    for col in ['lag_15m', 'lag_1h', 'lag_1d', 'lag_1w',
+                'rolling_1h_mean', 'rolling_3h_mean', 'rolling_1d_mean',
+                'minutes_since_last', 'minutes_of_day']:
+        if col in df.columns:
+            df[col] = df[col].astype('float32')
+
     return df
+
 
 @st.cache_data
 def process_data_for_forecasting(csv_data_string):
     df = pd.read_csv(StringIO(csv_data_string))
+
+    # ✅ Drop unused columns *after* Count is created
     df['DateTime'] = pd.to_datetime(df['DateTime'])
-    # Each row = 1 recorded event
-    df['Count'] = 1
+    df['Count'] = 1  # create the column first
+
+    # now keep only necessary columns
+    if 'Retailer' in df.columns:
+        df = df[['DateTime', 'Count', 'Retailer']].copy()
+    else:
+        st.error("Error: CSV must include a 'Retailer' column.")
+        return pd.DataFrame()
+
+
+    # 🧮 Use smaller dtypes for lower memory usage
+    df['Count'] = df['Count'].astype('float32')
+
 
     # Resample to 15-minute intervals per retailer
     df_15min = (
@@ -210,15 +230,32 @@ def process_data_for_forecasting(csv_data_string):
     for r in all_retailers:
         retailer_df = df_15min[df_15min["Retailer"] == r].copy()
         # ensure continuous 15-min index over the observed range
-        full_range = pd.date_range(start=retailer_df['DateTime'].min(), end=retailer_df['DateTime'].max(), freq='15T')
-        retailer_df = retailer_df.set_index('DateTime').reindex(full_range).fillna(0).reset_index().rename(columns={'index': 'DateTime'})
+        full_range = pd.date_range(start=retailer_df['DateTime'].min(),
+                                   end=retailer_df['DateTime'].max(),
+                                   freq='15T')
+        retailer_df = (
+            retailer_df.set_index('DateTime')
+                       .reindex(full_range)
+                       .fillna(0)
+                       .reset_index()
+                       .rename(columns={'index': 'DateTime'})
+        )
         retailer_df['Retailer'] = r
+
+        # 🧠 Create compact features
         retailer_featured_df = create_features_for_ml(retailer_df)
+
+        # free intermediate memory
+        del retailer_df
+        gc.collect()
+
         processed_dfs.append(retailer_featured_df)
+
     if processed_dfs:
         return pd.concat(processed_dfs, ignore_index=True)
     else:
         return pd.DataFrame(columns=['DateTime', 'Retailer', 'Count'])
+
 
 def filter_by_time(df, future_only=True):
     # Ensure ds is timezone-aware in UTC for robust comparisons
@@ -285,55 +322,6 @@ def get_big_restocks(forecast_df, threshold_factor=1.3):
 
     return df, big_restocks
 
-def train_prophet_model(data, forecast_horizon):
-    # data: DataFrame for single retailer with DateTime and Count at 15-min intervals
-    df_prophet = data.rename(columns={"DateTime": "ds", "Count": "y"})[['ds', 'y']].copy()
-    df_prophet['ds'] = pd.to_datetime(df_prophet['ds'])
-    # Prophet expects naive times; we'll treat them as UTC for consistent handling
-    df_prophet['ds'] = df_prophet['ds'].dt.tz_localize(pytz.UTC).dt.tz_convert(pytz.UTC).dt.tz_localize(None)
-
-    # --- IMPROVED Prophet Model SETUP ---
-    # Step 1: Smooth data slightly for better signal
-    df_prophet['y'] = df_prophet['y'].rolling(2, min_periods=1).mean()
-
-    # Step 2: Define known special events (optional – you can add real Pokémon launch dates here)
-    holidays = pd.DataFrame({
-        'holiday': 'release_day',
-        'ds': pd.to_datetime([
-            '2025-02-09',  # example release dates
-            '2025-05-10',
-            '2025-08-20'
-        ])
-    })
-
-    # Step 3: Initialize Prophet with better tuning
-    model = Prophet(
-        yearly_seasonality=False,
-        weekly_seasonality=True,
-        daily_seasonality=True,
-        holidays=holidays,
-        changepoint_prior_scale=0.4,     # allows moderate flexibility
-        seasonality_prior_scale=15.0,     # stronger cycles
-        interval_width=0.95
-    )
-
-    # Step 4: Add finer seasonality cycles
-    model.add_seasonality(name='hourly', period=1, fourier_order=20)
-    model.add_seasonality(name='3hourly', period=3, fourier_order=10)
-
-
-
-    model.fit(df_prophet)
-    # forecast_horizon is in days; convert to number of 15-min periods
-    periods = forecast_horizon * 24 * 4
-    future = model.make_future_dataframe(periods=periods, freq="15T")
-    forecast = model.predict(future)
-    # ensure ds is timezone-aware UTC (for consistent downstream conversion)
-    forecast['ds'] = pd.to_datetime(forecast['ds']).dt.tz_localize(pytz.UTC)
-    forecast['Weekday'] = forecast['ds'].dt.tz_convert(pytz.UTC).dt.day_name()
-    # Prophet returns 'yhat' as predictions; normalize to positive
-    forecast['yhat'] = forecast['yhat'].clip(lower=0)
-    return model, forecast
 
 @st.cache_data
 def train_ml_model(data, forecast_horizon, model_type='lgbm'):
@@ -752,7 +740,7 @@ if 'Target' in retailers:
     default_index = retailers.index('Target')
 retailer = st.sidebar.selectbox("Choose a retailer to forecast", retailers, index=default_index, label_visibility="collapsed")
 retailer_history_df = full_df[full_df['Retailer'] == retailer]
-forecast_horizon = st.sidebar.slider("Forecast Horizon (days)", 1, 30, 14, 1)
+forecast_horizon = 14  # fixed to 14 days
 forecast_hours = forecast_horizon * 24
 
 # -------------------------
@@ -873,30 +861,22 @@ import catboost as cb
 @st.cache_resource
 def load_pretrained_models(retailer):
     try:
-        prophet_model = pickle.load(open(f"models/prophet_{retailer}.pkl", "rb"))
         lgbm_model = lgb.Booster(model_file=f"models/lgbm_{retailer}.txt")
         xgb_model = xgb.Booster(model_file=f"models/xgb_{retailer}.json")
         cat_model = cb.CatBoostRegressor()
         cat_model.load_model(f"models/cat_{retailer}.cbm")
-        return prophet_model, lgbm_model, xgb_model, cat_model
+        return lgbm_model, xgb_model, cat_model
     except Exception as e:
         st.error(f"Error loading pre-trained models for {retailer}: {e}")
         st.stop()
 
 with st.spinner("Loading pre-trained models..."):
-    prophet_model, lgbm_model, xgb_model, cat_model = load_pretrained_models(retailer)
+    lgbm_model, xgb_model, cat_model = load_pretrained_models(retailer)
 
     # -------------------------------------
     # 🔮 Generate Predictions Using Pre-Trained Models
     # -------------------------------------
     periods = forecast_horizon * 24 * 4  # 15-min intervals
-
-    # Prophet Prediction
-    future = prophet_model.make_future_dataframe(periods=periods, freq="15T")
-    prophet_forecast_raw = prophet_model.predict(future)
-    prophet_forecast_raw['ds'] = pd.to_datetime(prophet_forecast_raw['ds']).dt.tz_localize(pytz.UTC)
-    prophet_forecast_raw['yhat'] = prophet_forecast_raw['yhat'].clip(lower=0)
-    prophet_forecast_raw['Weekday'] = prophet_forecast_raw['ds'].dt.day_name()
 
     # -------------------------------------
     # ⚙️ Prepare Features for ML Models
@@ -982,31 +962,25 @@ with st.spinner("Loading pre-trained models..."):
 
 
 # Filter only future predictions (in UTC) and convert to local for display
-prophet_forecast = filter_by_time(prophet_forecast_raw)
 xgb_forecast = filter_by_time(xgb_forecast_raw)
 lgbm_forecast = filter_by_time(lgbm_forecast_raw)
 cat_forecast = filter_by_time(cat_forecast_raw)
 
 # Convert all forecast times to viewer's local timezone for display and charting
-prophet_forecast = convert_to_local_time(prophet_forecast, time_col='ds', tz_str=selected_tz)
 xgb_forecast = convert_to_local_time(xgb_forecast, time_col='ds', tz_str=selected_tz) if xgb_forecast is not None else xgb_forecast
 lgbm_forecast = convert_to_local_time(lgbm_forecast, time_col='ds', tz_str=selected_tz) if lgbm_forecast is not None else lgbm_forecast
 cat_forecast = convert_to_local_time(cat_forecast, time_col='ds', tz_str=selected_tz) if cat_forecast is not None else cat_forecast
 
 # But keep copies of UTC forecasts for consensus logic (use UTC internally)
-prophet_utc = filter_by_time(prophet_forecast_raw)
 xgb_utc = filter_by_time(xgb_forecast_raw)
 lgbm_utc = filter_by_time(lgbm_forecast_raw)
 cat_utc = filter_by_time(cat_forecast_raw)
 
-_, prophet_big = get_big_restocks(prophet_utc)
 _, xgb_big = get_big_restocks(xgb_utc)
 _, lgbm_big = get_big_restocks(lgbm_utc)
 _, cat_big = get_big_restocks(cat_utc)
 
 all_big_restocks = []
-for _, row in prophet_big.iterrows():
-    all_big_restocks.append({'ds': row['ds'], 'model': 'Prophet', 'yhat': row['yhat']})
 for _, row in xgb_big.iterrows():
     all_big_restocks.append({'ds': row['ds'], 'model': 'XGBoost', 'yhat': row['yhat']})
 for _, row in lgbm_big.iterrows():
@@ -1069,7 +1043,7 @@ else:
 # 7. Main Tabs
 # -------------------------
 chart_color = "#FFA500"  # Default orange/yellow for charts
-tab_names = ["⭐ Prediction Schedule", "📊 Analysis", "🔮 Prophet", "🚀 LightGBM", "🌟 XGBoost", "🐾 CatBoost"]
+tab_names = ["📊 Analysis", "🔮 Prophet", "🚀 LightGBM", "🌟 XGBoost", "🐾 CatBoost"]
 tabs = st.tabs(tab_names)
 
 with tabs[0]:
@@ -1083,26 +1057,19 @@ with tabs[1]:
     st.header("Analysis Heatmaps")
     st.markdown("These charts show the typical patterns of restock activity, based on model forecasts.")
     st.subheader("Hourly Activity Heatmap")
-    if prophet_forecast is not None and not prophet_forecast.empty:
-        hourly_fig = create_hourly_heatmap(prophet_forecast, retailer)
-        st.plotly_chart(hourly_fig, use_container_width=True)
     st.subheader("Model Feature Importance")
     fig_imp = create_importance_chart(importance_df)
     st.plotly_chart(fig_imp, use_container_width=True)
 
 with tabs[2]:
-    st.header("🔮 Prophet Model Details")
-    fig_prophet = create_forecast_chart(prophet_forecast, prophet_big, retailer, "Prophet Forecast", chart_color)
-    st.plotly_chart(fig_prophet, use_container_width=True)
-with tabs[3]:
     st.header("🚀 LightGBM Model Details")
     fig_lgbm = create_forecast_chart(lgbm_forecast, lgbm_big, retailer, "LightGBM Forecast", chart_color)
     st.plotly_chart(fig_lgbm, use_container_width=True)
-with tabs[4]:
+with tabs[3]:
     st.header("🌟 XGBoost Model Details")
     fig_xgb = create_forecast_chart(xgb_forecast, xgb_big, retailer, "XGBoost Forecast", chart_color)
     st.plotly_chart(fig_xgb, use_container_width=True)
-with tabs[5]:
+with tabs[4]:
     st.header("🐾 CatBoost Model Details")
     fig_cat = create_forecast_chart(cat_forecast, cat_big, retailer, "CatBoost Forecast", chart_color)
     st.plotly_chart(fig_cat, use_container_width=True)
