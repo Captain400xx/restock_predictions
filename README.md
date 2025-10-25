@@ -44,7 +44,7 @@ streamlit run app2.py
 
 ## 🧾 Version History
 
-### Version 5.1 Update (Performance Optimization Release):
+### Version 6.1 (Beta) Update (Performance Optimization Release):
 
 - 🚀 Massive Memory Reduction: Dropped from ~800 MB → ~240 MB by removing Prophet, caching efficiently, and compressing data types.
 - ⚙️ Optimized Data Pipeline: Added early column filtering, smaller numeric types (int8, float32), and gc.collect() cleanup to reduce memory load.
