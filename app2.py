@@ -674,7 +674,6 @@ with st.expander("👋 How to Use This App", expanded=True):
         - 🔴 **Low Confidence**: Weak or single-model signal
 
     ### 🤖 Model Overview
-    - **Prophet:** Detects consistent time-based patterns — ideal for recurring events such as nightly or weekly restock cycles. It captures trends like Target’s regular restocks but may smooth out sudden spikes.  
     - **LightGBM:** Reacts quickly to recent restock changes and short-term bursts of activity. Best for spotting sudden shifts in timing, like when a retailer starts restocking earlier than usual.  
     - **XGBoost:** Balances long-term and short-term trends, handling irregular restock patterns across days or weeks. Produces stable, moderate predictions with fewer false alerts.  
     - **CatBoost:** Learns subtle timing differences between retailers and detects patterns hidden within categorical data. Great at recognizing nuanced behaviors, such as retailer-specific restock quirks.  
@@ -779,7 +778,7 @@ st.sidebar.markdown(
 
 # Add spacing / separator before countdowns
 st.sidebar.markdown("<hr style='border:1px solid #333;margin:10px 0;'>", unsafe_allow_html=True)
-st.sidebar.markdown("<div style='font-size:0.95em; font-weight:600; color:#ccc;'>⏳ Upcoming Restocks</div>", unsafe_allow_html=True)
+st.sidebar.markdown("<div style='font-size:0.95em; font-weight:600; color:#ccc;'>⏳ Upcoming Restocks (15, Intervals) </div>", unsafe_allow_html=True)
 
 # Countdown placeholders (embedded under Data Summary)
 countdown_high = st.sidebar.empty()
@@ -1073,3 +1072,4 @@ with tabs[4]:
     st.header("🐾 CatBoost Model Details")
     fig_cat = create_forecast_chart(cat_forecast, cat_big, retailer, "CatBoost Forecast", chart_color)
     st.plotly_chart(fig_cat, use_container_width=True)
+
