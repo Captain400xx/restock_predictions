@@ -23,7 +23,7 @@
 
 ### **1. Clone the Repository**
 ```bash
-git clone https://github.com/<your-username>/restock_forecast_app.git
+git clone https://github.com/Captain400xx/restock_forecast_app.git
 ```
 
 ## Set Up Your Data
