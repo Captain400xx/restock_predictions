@@ -44,9 +44,20 @@ streamlit run app.py
 
 ## 🧾 Version History
 
+### Version 6.0 (Beta) — UI & Optimization Update
+
+*Release Date: October 23, 2025*
+
+- Discord Banner Integration: Added a responsive banner with gradient background, live member count, and a clickable “Join Now” button linking to the RestockR Discord. Text and button styling now match the app’s theme for a unified look.
+- Countdown Display Improvements: Reworked countdown timers for High, Medium, and Low confidence restocks — now positioned inside the Data Summary section with better spacing, color coding, and bold typography for clarity.
+- Sidebar Layout Fixes: Removed unwanted blank space above “⚙️ Controls” while restoring the sidebar collapse button. Sidebar now loads flush to the top with consistent alignment and compact padding.
+- Visual & Font Enhancements: Standardized fonts, increased countdown number size, and made key text (like the Discord banner) extra bold for improved readability and emphasis.
+- Main Page Spacing & Header Adjustments: Minimized unused top padding in the main content area while keeping the rerun/menu bar visible and functional.
+- Performance Prep: Began optimizing for lower memory usage by transitioning model training to a pre-trained, inference-only setup to improve Render efficiency and scalability.
+
 ### Version 5.0 (Beta) – Major Overhaul
 
-*Release Date: October 2025*
+*Release Date: October 23, 2025*
 
 **🔧 Core Model & Forecasting Updates**
 
