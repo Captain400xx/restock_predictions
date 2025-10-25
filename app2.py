@@ -55,6 +55,57 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+# Remove excess top padding from sidebar and main content
+st.markdown("""
+<style>
+/* Keep the collapse chevron fully visible & clickable */
+[data-testid="stSidebarHeader"] {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: flex-end !important;
+
+  /* tiny but tall enough for the icon */
+  height: 1.8rem !important;
+  min-height: 1.8rem !important;
+
+  padding: 0.15rem 0.35rem 0 0 !important;  /* small right/top padding */
+  margin: 0 !important;
+  overflow: visible !important;             /* prevent clipping */
+  z-index: 5;                               /* keep above content */
+}
+
+/* Ensure the toggle button itself isn't clipped */
+[data-testid="stSidebarHeader"] [role="button"],
+[data-testid="stSidebarHeader"] button {
+  transform: translateY(0);   /* reset any inherited shift */
+  pointer-events: auto;
+}
+
+/* Remove extra gap above your content but leave a hair of space */
+section[data-testid="stSidebar"] > div:nth-child(2),
+[data-testid="stSidebar"] > div:first-child,
+[data-testid="stSidebarContent"] {
+  padding-top: 0.25rem !important;
+  margin-top: 0 !important;
+}
+
+/* Keep the main app header/rerun bar intact */
+header[data-testid="stHeader"] {
+  visibility: visible !important;
+  min-height: 2rem !important;
+  height: auto !important;
+}
+
+/* Slightly tighten the main content top padding */
+div.block-container { padding-top: 0.5rem !important; }
+</style>
+""", unsafe_allow_html=True)
+
+
+
+
+
+
 
 EASTERN = pytz.timezone('US/Eastern')
 DATA_FILE = "my_restock_data.csv"
@@ -570,13 +621,43 @@ with col2:
     st.markdown(
         """
         <h1 style='font-size:48px; font-weight:900;'>
-            <span style='color:#00C46A;'>Restock</span><span style='color:#FF4B4B;'>R</span>
+            <span style='color:#00C46A;'>Restock</span><span style='color:#c94bff;'>R</span>
             <span style='color:#00C46A;'> Predictions</span>
+
         </h1>
         """,
         unsafe_allow_html=True
     )
 
+st.markdown(
+    """
+    <div style="
+        background: linear-gradient(90deg, #00C46A,#c94bff);
+        padding: 10px 20px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        color: white;
+        font-family: 'Segoe UI', sans-serif;
+    ">
+        <div style="flex: 1;">
+            <span style="font-size:1.1em; font-weight:750; color:#6205f5;">
+                Join our Discord Community
+            </span><br>
+            <span style="font-size:0.9em; font-weight:750; color:#6205f5;">
+                10,913 Members
+            </span>
+        </div>
+        <a href="https://discord.gg/TptpVy2VnS" target="_blank"
+           style="background:#00C46A; color:#6205f5; padding:8px 16px; border-radius:6px;
+                  text-decoration:none; font-weight:570; box-shadow:0 0 6px rgba(0,0,0,0.2);">
+            Join Now
+        </span>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 
 
@@ -587,7 +668,6 @@ full_df = process_data_for_forecasting(raw_data_string)
 
 with st.expander("👋 How to Use This App", expanded=True):
     st.markdown("""
-    This application analyzes historical Pokémon card restock data and uses multiple machine learning models to forecast future restock activity.
 
     ### 🧭 Getting Started
     - **Select a Retailer:** Choose from the sidebar dropdown.  
@@ -600,7 +680,10 @@ with st.expander("👋 How to Use This App", expanded=True):
     ### 📈 Understanding Predictions
     Each restock event is counted as **1**, so model outputs represent the **expected frequency of restocks per 15-minute interval**.  
     - **Low values (0–1):** Minimal or no restock activity expected.  
-    - **High values (5+):** Indicates multiple restocks likely during that time period.  
+    - **High values (5+):** Indicates multiple restocks likely during that time period.
+        - 🟢 **High Confidence**: Strong model agreement
+        - 🟠 **Medium Confidence**: Moderate agreement
+        - 🔴 **Low Confidence**: Weak or single-model signal
 
     ### 🤖 Model Overview
     - **Prophet:** Detects consistent time-based patterns — ideal for recurring events such as nightly or weekly restock cycles. It captures trends like Target’s regular restocks but may smooth out sudden spikes.  
@@ -616,15 +699,55 @@ with st.expander("👋 How to Use This App", expanded=True):
 # -------------------------
 # 6. Sidebar Controls
 # -------------------------
-st.markdown("""<style>[data-testid="stSidebar"] > div:first-child {padding-top: 1rem;}</style>""", unsafe_allow_html=True)
+st.markdown("""
+<style>
+/* tighten the very first wrapper in the sidebar */
+[data-testid="stSidebar"] > div:first-child{
+  padding-top:0 !important;
+  margin-top:0 !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
-st.sidebar.title("⚙️ Controls")
-retailers = sorted(full_df["Retailer"].unique().tolist())
-if not retailers:
-    st.error("No retailers found.")
-    st.stop()
+st.markdown("""
+<style>
+/* keep header visible (rerun stays), just compact */
+header[data-testid="stHeader"]{
+  min-height: 2rem !important;
+  height:auto !important;
+  visibility: visible !important;
+}
+/* tighten main block’s top padding */
+div.block-container{ padding-top:.5rem !important; }
+/* kill any top margin on the first element */
+div.block-container > div:first-child{ margin-top:0 !important; padding-top:0 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# -------------------------
+# ⚙️ Controls
+# -------------------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ Controls")
+
+COMMON_TZ = [
+    "UTC",
+    "US/Eastern",
+    "US/Central",
+    "US/Mountain",
+    "US/Pacific",
+    "Europe/London",
+    "Europe/Berlin",
+    "Asia/Tokyo",
+    "Australia/Sydney"
+]
+default_tz = "US/Eastern"
+selected_tz = st.sidebar.selectbox("Display Timezone", COMMON_TZ, index=COMMON_TZ.index(default_tz))
+
 
 default_index = 0
+retailers = sorted(full_df["Retailer"].unique().tolist())
 if 'Target' in retailers:
     default_index = retailers.index('Target')
 retailer = st.sidebar.selectbox("Choose a retailer to forecast", retailers, index=default_index, label_visibility="collapsed")
@@ -661,11 +784,7 @@ else:
 # Legend / key
 st.sidebar.markdown(
     """
-    <div style="font-size: 0.85em; line-height: 1.4;">
-        <span style="color:#28a745; font-weight:bold;">🟢 High Confidence</span>: Strong model agreement<br>
-        <span style="color:#FFA500; font-weight:bold;">🟠 Medium Confidence</span>: Moderate agreement<br>
-        <span style="color:#FF4B4B; font-weight:bold;">🔴 Low Confidence</span>: Weak or single-model signal
-    </div>
+    
     """,
     unsafe_allow_html=True,
 )
@@ -680,7 +799,7 @@ countdown_medium = st.sidebar.empty()
 countdown_low = st.sidebar.empty()
 
 def render_countdown_block(confidence_label, color, placeholder):
-    """Compact, balanced countdown block with smaller labels and larger numbers."""
+    """Displays the next countdown timer in the sidebar."""
     if consensus_summary.empty or confidence_label not in consensus_summary['Confidence'].values:
         placeholder.markdown(
             f"<div style='color:{color}; font-size:0.85em; margin-top:2px;'>No {confidence_label}-confidence restock scheduled.</div>",
@@ -695,12 +814,17 @@ def render_countdown_block(confidence_label, color, placeholder):
     target_timestamp_ms = int(target_time.timestamp() * 1000)
 
     js = f"""
-    <div style='margin-top:4px; margin-bottom:2px;'>
-        <div style='color:{color}; font-weight:600; font-size:0.8em; margin-bottom:2px;'>
+    <div style='margin-top:2px; margin-bottom:-4px;'>
+        <div style='font-family:"Segoe UI", sans-serif; color:{color}; font-weight:600; font-size:0.9em; margin-bottom:2px;'>
             Next {confidence_label} Confidence Restock:
         </div>
-        <div id="countdown_{confidence_label}" 
-             style="color:{color}; font-size:1.3em; font-weight:800; margin-left:2px; line-height:1.1;"></div>
+        <div id="countdown_{confidence_label}"
+             style="font-family:'Segoe UI', sans-serif;
+                    font-size:22px;
+                    font-weight:700;
+                    line-height:1.2;
+                    color:{color};">
+        </div>
     </div>
     <script>
     var targetTime_{confidence_label} = {target_timestamp_ms};
@@ -723,42 +847,12 @@ def render_countdown_block(confidence_label, color, placeholder):
     updateCountdown_{confidence_label}();
     </script>
     """
-    with placeholder.container():
-        components.html(js, height=50)
 
-
-
-
-
-
-
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Chart Customization")
-
-chart_color = "#FFA500"  # default orange/yellow
+    # ✅ Use components.html() directly inside the placeholder
+    with placeholder:
+        components.html(js, height=75, scrolling=False)
 
 # -------------------------
-# Sidebar timezone selector (add this near your other sidebar controls)
-# -------------------------
-import pytz
-
-COMMON_TZ = [
-    "UTC",
-    "US/Eastern",
-    "US/Central",
-    "US/Mountain",
-    "US/Pacific",
-    "Europe/London",
-    "Europe/Berlin",
-    "Asia/Tokyo",
-    "Australia/Sydney"
-]
-# default to Eastern
-default_tz = "US/Eastern"
-# put user's tz selection into a variable used app-wide
-selected_tz = st.sidebar.selectbox("Display timezone for charts & labels", COMMON_TZ, index=COMMON_TZ.index(default_tz))
-st.sidebar.caption(f"Selected timezone: {selected_tz}")
 
 
 st.sidebar.markdown("---")
@@ -951,14 +1045,30 @@ if consensus_summary.empty:
     countdown_medium.empty()
     countdown_low.empty()
 else:
-    render_countdown_block("High", "#28a745", countdown_high)
-    render_countdown_block("Medium", "#FFA500", countdown_medium)
-    render_countdown_block("Low", "#FF4B4B", countdown_low)
+    available_conf = consensus_summary['Confidence'].unique().tolist()
+
+    if "High" in available_conf:
+        render_countdown_block("High", "#28a745", countdown_high)
+    else:
+        countdown_high.markdown("<div style='color:#28a745; font-size:0.85em;'>No High-confidence restock scheduled.</div>", unsafe_allow_html=True)
+
+    if "Medium" in available_conf:
+        render_countdown_block("Medium", "#FFA500", countdown_medium)
+    else:
+        countdown_medium.markdown("<div style='color:#FFA500; font-size:0.85em;'>No Medium-confidence restock scheduled.</div>", unsafe_allow_html=True)
+
+    if "Low" in available_conf:
+        render_countdown_block("Low", "#FF4B4B", countdown_low)
+    else:
+        countdown_low.markdown("<div style='color:#FF4B4B; font-size:0.85em;'>No Low-confidence restock scheduled.</div>", unsafe_allow_html=True)
+
+
 
 
 # -------------------------
 # 7. Main Tabs
 # -------------------------
+chart_color = "#FFA500"  # Default orange/yellow for charts
 tab_names = ["⭐ Prediction Schedule", "📊 Analysis", "🔮 Prophet", "🚀 LightGBM", "🌟 XGBoost", "🐾 CatBoost"]
 tabs = st.tabs(tab_names)
 
