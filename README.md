@@ -46,7 +46,7 @@ streamlit run app2.py
 
 ### Version 6.0 (Beta) — UI & Optimization Update
 
-*Release Date: October 23, 2025*
+*Release Date: October 24, 2025*
 
 - Discord Banner Integration: Added a responsive banner with gradient background, live member count, and a clickable “Join Now” button linking to the RestockR Discord. Text and button styling now match the app’s theme for a unified look.
 - Countdown Display Improvements: Reworked countdown timers for High, Medium, and Low confidence restocks — now positioned inside the Data Summary section with better spacing, color coding, and bold typography for clarity.
